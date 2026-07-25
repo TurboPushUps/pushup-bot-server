@@ -3,7 +3,7 @@ import psycopg2
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, WebAppInfo, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, WebAppInfo, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
 # ===== НАСТРОЙКИ =====
@@ -31,7 +31,6 @@ def get_cursor():
     try:
         if db is None or db.closed:
             raise psycopg2.OperationalError("Соединение закрыто")
-        # Проверяем, что соединение реально живое
         cursor = db.cursor()
         cursor.execute("SELECT 1")
         return db.cursor()
@@ -106,12 +105,15 @@ async def start_handler(message: Message):
     username = message.from_user.first_name or message.from_user.username or "Игрок"
     ensure_user_exists(user_id, username)
 
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="💪 Открыть Pushup Tracker",
-            web_app=WebAppInfo(url=WEBAPP_URL)
-        )]
-    ])
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(
+                text="💪 Открыть Pushup Tracker",
+                web_app=WebAppInfo(url=WEBAPP_URL)
+            )]
+        ],
+        resize_keyboard=True
+    )
 
     await message.answer(
         "💪 Добро пожаловать!\n\n"
