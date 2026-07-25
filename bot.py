@@ -6,8 +6,6 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, WebAppInfo, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
-# ===== НАСТРОЙКИ =====
-
 TOKEN = os.environ.get("BOT_TOKEN")
 WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST")
 WEBHOOK_PATH = "/webhook"
@@ -20,13 +18,10 @@ WEBAPP_URL = "https://turbopushups.github.io/pushup-camera/index.html"
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# ===== БАЗА ДАННЫХ (PostgreSQL) с автопереподключением =====
-
 db = None
 
 
 def get_cursor():
-    """Возвращает рабочий курсор базы данных, переподключаясь при необходимости."""
     global db
     try:
         if db is None or db.closed:
@@ -72,8 +67,6 @@ def ensure_user_exists(user_id, username=None):
         )
 
 
-# ===== УРОВНИ =====
-
 LEVELS = [
     (5000, "👑 Легенда зала"),
     (1500, "⚡ Терминатор"),
@@ -97,19 +90,19 @@ def get_next_level_info(points):
     return None, None
 
 
-# ===== ОБРАБОТЧИКИ БОТА =====
-
 @dp.message(CommandStart())
 async def start_handler(message: Message):
     user_id = message.from_user.id
     username = message.from_user.first_name or message.from_user.username or "Игрок"
     ensure_user_exists(user_id, username)
 
+    personal_url = f"{WEBAPP_URL}?user_id={user_id}"
+
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(
                 text="💪 Открыть Pushup Tracker",
-                web_app=WebAppInfo(url=WEBAPP_URL)
+                web_app=WebAppInfo(url=personal_url)
             )]
         ],
         resize_keyboard=True
@@ -153,59 +146,6 @@ async def profile_handler(message: Message):
 
     await message.answer(text)
 
-
-@dp.message(F.web_app_data)
-async def webapp_data_handler(message: Message):
-    user_id = message.from_user.id
-    raw_data = message.web_app_data.data
-
-    if not raw_data.isdigit():
-        await message.answer("Не удалось распознать результат подхода 😕")
-        return
-
-    count = int(raw_data)
-
-    if count == 0:
-        await message.answer("Подход завершён, но отжиманий не засчитано 🤔")
-        return
-
-    points_earned = count * 10
-
-    username = message.from_user.first_name or message.from_user.username or "Игрок"
-
-    try:
-        ensure_user_exists(user_id, username)
-
-        cursor = get_cursor()
-        cursor.execute("SELECT total_points FROM users WHERE user_id = %s", (user_id,))
-        (points_before,) = cursor.fetchone()
-        level_before = get_level(points_before)
-
-        cursor = get_cursor()
-        cursor.execute(
-            "UPDATE users SET total_points = total_points + %s, total_pushups = total_pushups + %s WHERE user_id = %s",
-            (points_earned, count, user_id)
-        )
-
-        points_after = points_before + points_earned
-        level_after = get_level(points_after)
-
-        text = (
-            f"Подход завершён! Засчитано: {count} отжиманий 💪\n"
-            f"Получено очков: +{points_earned} ⭐"
-        )
-
-        if level_after != level_before:
-            text += f"\n\n🎉 Новое звание: {level_after}!"
-
-        await message.answer(text)
-
-    except Exception as e:
-        print(f"Ошибка при сохранении подхода: {e}")
-        await message.answer("Произошла ошибка при сохранении. Попробуй ещё раз через минуту 🙏")
-
-
-# ===== API ДЛЯ САЙТА =====
 
 async def api_profile(request):
     user_id = request.query.get("user_id")
@@ -255,11 +195,63 @@ async def api_leaderboard(request):
         return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
 
 
+async def api_save_pushups(request):
+    try:
+        data = await request.json()
+        user_id = data.get("user_id")
+        count = data.get("count")
+
+        if not user_id or not count or count <= 0:
+            return web.json_response({"error": "Некорректные данные"}, status=400)
+
+        user_id = int(user_id)
+        count = int(count)
+        points_earned = count * 10
+
+        ensure_user_exists(user_id)
+
+        cursor = get_cursor()
+        cursor.execute("SELECT total_points FROM users WHERE user_id = %s", (user_id,))
+        (points_before,) = cursor.fetchone()
+        level_before = get_level(points_before)
+
+        cursor = get_cursor()
+        cursor.execute(
+            "UPDATE users SET total_points = total_points + %s, total_pushups = total_pushups + %s WHERE user_id = %s",
+            (points_earned, count, user_id)
+        )
+
+        points_after = points_before + points_earned
+        level_after = get_level(points_after)
+
+        level_up = level_after != level_before
+
+        try:
+            text = (
+                f"Подход завершён! Засчитано: {count} отжиманий 💪\n"
+                f"Получено очков: +{points_earned} ⭐"
+            )
+            if level_up:
+                text += f"\n\n🎉 Новое звание: {level_after}!"
+            await bot.send_message(user_id, text)
+        except Exception as notify_error:
+            print(f"Не удалось отправить уведомление: {notify_error}")
+
+        return web.json_response({
+            "success": True,
+            "points_earned": points_earned,
+            "level_up": level_up,
+            "new_level": level_after if level_up else None
+        })
+
+    except Exception as e:
+        print(f"Ошибка в api_save_pushups: {e}")
+        return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
+
+
 async def api_health(request):
     return web.json_response({"status": "ok"})
 
-
-# ===== CORS =====
 
 @web.middleware
 async def cors_middleware(request, handler):
@@ -269,11 +261,9 @@ async def cors_middleware(request, handler):
         response = await handler(request)
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Headers"] = "*"
-    response.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     return response
 
-
-# ===== ЗАПУСК СЕРВЕРА =====
 
 async def on_startup(bot: Bot):
     await bot.set_webhook(WEBHOOK_URL)
@@ -285,6 +275,7 @@ def main():
     app.router.add_get("/", api_health)
     app.router.add_get("/api/profile", api_profile)
     app.router.add_get("/api/leaderboard", api_leaderboard)
+    app.router.add_post("/api/save_pushups", api_save_pushups)
 
     dp.startup.register(on_startup)
 
