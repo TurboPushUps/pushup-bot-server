@@ -226,17 +226,6 @@ async def api_save_pushups(request):
 
         level_up = level_after != level_before
 
-        try:
-            text = (
-                f"Подход завершён! Засчитано: {count} отжиманий 💪\n"
-                f"Получено очков: +{points_earned} ⭐"
-            )
-            if level_up:
-                text += f"\n\n🎉 Новое звание: {level_after}!"
-            await bot.send_message(user_id, text)
-        except Exception as notify_error:
-            print(f"Не удалось отправить уведомление: {notify_error}")
-
         return web.json_response({
             "success": True,
             "points_earned": points_earned,
