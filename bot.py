@@ -1,7 +1,8 @@
 import os
+import re
 import psycopg2
 from aiohttp import web
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, Dispatcher
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, WebAppInfo, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
@@ -42,10 +43,12 @@ def init_db():
     CREATE TABLE IF NOT EXISTS users (
         user_id BIGINT PRIMARY KEY,
         username TEXT,
+        nickname TEXT,
         total_points INTEGER DEFAULT 0,
         total_pushups INTEGER DEFAULT 0
     )
     """)
+    cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS nickname TEXT")
 
 
 init_db()
@@ -65,6 +68,32 @@ def ensure_user_exists(user_id, username=None):
             "UPDATE users SET username = %s WHERE user_id = %s",
             (username, user_id)
         )
+
+
+# ===== ПРОВЕРКА НИКНЕЙМА =====
+
+BANNED_ROOTS = [
+    "хуй", "хуе", "хуи", "пизд", "ебат", "ебал", "ёбан", "еба", "бляд",
+    "сука ", "мудак", "долбоеб", "долбоёб", "пидор", "пидар", "залуп",
+    "fuck", "shit", "bitch", "cunt", "asshole", "nigger", "faggot", "whore"
+]
+
+
+def is_nickname_valid(nickname: str):
+    nickname = nickname.strip()
+
+    if len(nickname) < 2 or len(nickname) > 20:
+        return False, "Имя должно быть от 2 до 20 символов."
+
+    if not re.match(r'^[a-zA-Zа-яА-ЯёЁ0-9 ]+$', nickname):
+        return False, "Используй только буквы, цифры и пробелы, без спецсимволов."
+
+    lowered = nickname.lower()
+    for root in BANNED_ROOTS:
+        if root in lowered:
+            return False, "Это имя недопустимо. Придумай, пожалуйста, другое."
+
+    return True, None
 
 
 LEVELS = [
@@ -89,6 +118,8 @@ def get_next_level_info(points):
             return threshold, title
     return None, None
 
+
+# ===== ОБРАБОТЧИКИ БОТА =====
 
 @dp.message(CommandStart())
 async def start_handler(message: Message):
@@ -119,32 +150,55 @@ async def start_handler(message: Message):
     )
 
 
-@dp.message(Command("profile"))
-async def profile_handler(message: Message):
-    user_id = message.from_user.id
+# ===== API ДЛЯ САЙТА =====
+
+async def api_user_status(request):
+    user_id = request.query.get("user_id")
+    if not user_id or not user_id.isdigit():
+        return web.json_response({"error": "user_id обязателен"}, status=400)
+
+    user_id = int(user_id)
     ensure_user_exists(user_id)
 
     cursor = get_cursor()
-    cursor.execute("SELECT total_points, total_pushups FROM users WHERE user_id = %s", (user_id,))
-    points, pushups = cursor.fetchone()
+    cursor.execute("SELECT nickname FROM users WHERE user_id = %s", (user_id,))
+    row = cursor.fetchone()
+    nickname = row[0] if row else None
 
-    level_title = get_level(points)
-    next_threshold, next_title = get_next_level_info(points)
+    return web.json_response({
+        "has_nickname": nickname is not None,
+        "nickname": nickname
+    })
 
-    text = (
-        f"📊 Твой профиль\n\n"
-        f"Звание: {level_title}\n"
-        f"Очки: {points} ⭐\n"
-        f"Всего отжиманий: {pushups} 💪\n"
-    )
 
-    if next_threshold is not None:
-        remaining = next_threshold - points
-        text += f"\nДо звания «{next_title}» осталось: {remaining} очков"
-    else:
-        text += "\nТы достиг максимального звания! 🎉"
+async def api_register_nickname(request):
+    try:
+        data = await request.json()
+        user_id = data.get("user_id")
+        nickname = data.get("nickname", "")
 
-    await message.answer(text)
+        if not user_id:
+            return web.json_response({"error": "user_id обязателен"}, status=400)
+
+        user_id = int(user_id)
+
+        valid, error = is_nickname_valid(nickname)
+        if not valid:
+            return web.json_response({"success": False, "error": error})
+
+        ensure_user_exists(user_id)
+
+        cursor = get_cursor()
+        cursor.execute(
+            "UPDATE users SET nickname = %s WHERE user_id = %s",
+            (nickname.strip(), user_id)
+        )
+
+        return web.json_response({"success": True, "nickname": nickname.strip()})
+
+    except Exception as e:
+        print(f"Ошибка в api_register_nickname: {e}")
+        return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
 
 
 async def api_profile(request):
@@ -180,12 +234,12 @@ async def api_leaderboard(request):
     try:
         cursor = get_cursor()
         cursor.execute(
-            "SELECT username, total_points FROM users ORDER BY total_points DESC LIMIT 10"
+            "SELECT COALESCE(nickname, username, 'Игрок'), total_points FROM users ORDER BY total_points DESC LIMIT 10"
         )
         rows = cursor.fetchall()
 
         leaderboard = [
-            {"name": name or "Игрок", "points": points}
+            {"name": name, "points": points}
             for name, points in rows
         ]
 
@@ -262,6 +316,8 @@ def main():
     app = web.Application(middlewares=[cors_middleware])
 
     app.router.add_get("/", api_health)
+    app.router.add_get("/api/user_status", api_user_status)
+    app.router.add_post("/api/register_nickname", api_register_nickname)
     app.router.add_get("/api/profile", api_profile)
     app.router.add_get("/api/leaderboard", api_leaderboard)
     app.router.add_post("/api/save_pushups", api_save_pushups)
