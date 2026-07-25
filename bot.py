@@ -1,5 +1,5 @@
 import os
-import sqlite3
+import psycopg2
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
@@ -9,46 +9,46 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 # ===== НАСТРОЙКИ =====
 
 TOKEN = os.environ.get("BOT_TOKEN")
-WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST")  # например: https://pushup-bot-server.onrender.com
+WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST")
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 WEBAPP_URL = "https://turbopushups.github.io/pushup-camera/index.html"
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# ===== БАЗА ДАННЫХ =====
+# ===== БАЗА ДАННЫХ (PostgreSQL) =====
 
-db = sqlite3.connect("pushup_bot.db")
+db = psycopg2.connect(DATABASE_URL)
+db.autocommit = True
 cursor = db.cursor()
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS users (
-    user_id INTEGER PRIMARY KEY,
+    user_id BIGINT PRIMARY KEY,
     username TEXT,
     total_points INTEGER DEFAULT 0,
     total_pushups INTEGER DEFAULT 0
 )
 """)
-db.commit()
 
 
 def ensure_user_exists(user_id, username=None):
-    cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
     user = cursor.fetchone()
     if user is None:
         cursor.execute(
-            "INSERT INTO users (user_id, username) VALUES (?, ?)",
+            "INSERT INTO users (user_id, username) VALUES (%s, %s)",
             (user_id, username)
         )
-        db.commit()
     elif username:
         cursor.execute(
-            "UPDATE users SET username = ? WHERE user_id = ?",
+            "UPDATE users SET username = %s WHERE user_id = %s",
             (username, user_id)
         )
-        db.commit()
 
 
 # ===== УРОВНИ =====
@@ -107,7 +107,7 @@ async def profile_handler(message: Message):
     user_id = message.from_user.id
     ensure_user_exists(user_id)
 
-    cursor.execute("SELECT total_points, total_pushups FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT total_points, total_pushups FROM users WHERE user_id = %s", (user_id,))
     points, pushups = cursor.fetchone()
 
     level_title = get_level(points)
@@ -149,15 +149,14 @@ async def webapp_data_handler(message: Message):
     username = message.from_user.first_name or message.from_user.username or "Игрок"
     ensure_user_exists(user_id, username)
 
-    cursor.execute("SELECT total_points FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT total_points FROM users WHERE user_id = %s", (user_id,))
     (points_before,) = cursor.fetchone()
     level_before = get_level(points_before)
 
     cursor.execute(
-        "UPDATE users SET total_points = total_points + ?, total_pushups = total_pushups + ? WHERE user_id = ?",
+        "UPDATE users SET total_points = total_points + %s, total_pushups = total_pushups + %s WHERE user_id = %s",
         (points_earned, count, user_id)
     )
-    db.commit()
 
     points_after = points_before + points_earned
     level_after = get_level(points_after)
@@ -183,7 +182,7 @@ async def api_profile(request):
     user_id = int(user_id)
     ensure_user_exists(user_id)
 
-    cursor.execute("SELECT total_points, total_pushups FROM users WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT total_points, total_pushups FROM users WHERE user_id = %s", (user_id,))
     points, pushups = cursor.fetchone()
 
     level_title = get_level(points)
@@ -216,7 +215,7 @@ async def api_health(request):
     return web.json_response({"status": "ok"})
 
 
-# ===== CORS (чтобы сайт с другого адреса мог обращаться к API) =====
+# ===== CORS =====
 
 @web.middleware
 async def cors_middleware(request, handler):
