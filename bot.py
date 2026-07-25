@@ -20,23 +20,45 @@ WEBAPP_URL = "https://turbopushups.github.io/pushup-camera/index.html"
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# ===== БАЗА ДАННЫХ (PostgreSQL) =====
+# ===== БАЗА ДАННЫХ (PostgreSQL) с автопереподключением =====
 
-db = psycopg2.connect(DATABASE_URL)
-db.autocommit = True
-cursor = db.cursor()
+db = None
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS users (
-    user_id BIGINT PRIMARY KEY,
-    username TEXT,
-    total_points INTEGER DEFAULT 0,
-    total_pushups INTEGER DEFAULT 0
-)
-""")
+
+def get_cursor():
+    """Возвращает рабочий курсор базы данных, переподключаясь при необходимости."""
+    global db
+    try:
+        if db is None or db.closed:
+            raise psycopg2.OperationalError("Соединение закрыто")
+        # Проверяем, что соединение реально живое
+        cursor = db.cursor()
+        cursor.execute("SELECT 1")
+        return db.cursor()
+    except (psycopg2.OperationalError, psycopg2.InterfaceError):
+        print("Переподключаемся к базе данных...")
+        db = psycopg2.connect(DATABASE_URL)
+        db.autocommit = True
+        return db.cursor()
+
+
+def init_db():
+    cursor = get_cursor()
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        user_id BIGINT PRIMARY KEY,
+        username TEXT,
+        total_points INTEGER DEFAULT 0,
+        total_pushups INTEGER DEFAULT 0
+    )
+    """)
+
+
+init_db()
 
 
 def ensure_user_exists(user_id, username=None):
+    cursor = get_cursor()
     cursor.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
     user = cursor.fetchone()
     if user is None:
@@ -107,6 +129,7 @@ async def profile_handler(message: Message):
     user_id = message.from_user.id
     ensure_user_exists(user_id)
 
+    cursor = get_cursor()
     cursor.execute("SELECT total_points, total_pushups FROM users WHERE user_id = %s", (user_id,))
     points, pushups = cursor.fetchone()
 
@@ -147,29 +170,37 @@ async def webapp_data_handler(message: Message):
     points_earned = count * 10
 
     username = message.from_user.first_name or message.from_user.username or "Игрок"
-    ensure_user_exists(user_id, username)
 
-    cursor.execute("SELECT total_points FROM users WHERE user_id = %s", (user_id,))
-    (points_before,) = cursor.fetchone()
-    level_before = get_level(points_before)
+    try:
+        ensure_user_exists(user_id, username)
 
-    cursor.execute(
-        "UPDATE users SET total_points = total_points + %s, total_pushups = total_pushups + %s WHERE user_id = %s",
-        (points_earned, count, user_id)
-    )
+        cursor = get_cursor()
+        cursor.execute("SELECT total_points FROM users WHERE user_id = %s", (user_id,))
+        (points_before,) = cursor.fetchone()
+        level_before = get_level(points_before)
 
-    points_after = points_before + points_earned
-    level_after = get_level(points_after)
+        cursor = get_cursor()
+        cursor.execute(
+            "UPDATE users SET total_points = total_points + %s, total_pushups = total_pushups + %s WHERE user_id = %s",
+            (points_earned, count, user_id)
+        )
 
-    text = (
-        f"Подход завершён! Засчитано: {count} отжиманий 💪\n"
-        f"Получено очков: +{points_earned} ⭐"
-    )
+        points_after = points_before + points_earned
+        level_after = get_level(points_after)
 
-    if level_after != level_before:
-        text += f"\n\n🎉 Новое звание: {level_after}!"
+        text = (
+            f"Подход завершён! Засчитано: {count} отжиманий 💪\n"
+            f"Получено очков: +{points_earned} ⭐"
+        )
 
-    await message.answer(text)
+        if level_after != level_before:
+            text += f"\n\n🎉 Новое звание: {level_after}!"
+
+        await message.answer(text)
+
+    except Exception as e:
+        print(f"Ошибка при сохранении подхода: {e}")
+        await message.answer("Произошла ошибка при сохранении. Попробуй ещё раз через минуту 🙏")
 
 
 # ===== API ДЛЯ САЙТА =====
@@ -180,35 +211,46 @@ async def api_profile(request):
         return web.json_response({"error": "user_id обязателен"}, status=400)
 
     user_id = int(user_id)
-    ensure_user_exists(user_id)
 
-    cursor.execute("SELECT total_points, total_pushups FROM users WHERE user_id = %s", (user_id,))
-    points, pushups = cursor.fetchone()
+    try:
+        ensure_user_exists(user_id)
 
-    level_title = get_level(points)
-    next_threshold, next_title = get_next_level_info(points)
+        cursor = get_cursor()
+        cursor.execute("SELECT total_points, total_pushups FROM users WHERE user_id = %s", (user_id,))
+        points, pushups = cursor.fetchone()
 
-    return web.json_response({
-        "level": level_title,
-        "points": points,
-        "total_pushups": pushups,
-        "next_level": next_title,
-        "points_to_next_level": (next_threshold - points) if next_threshold else None
-    })
+        level_title = get_level(points)
+        next_threshold, next_title = get_next_level_info(points)
+
+        return web.json_response({
+            "level": level_title,
+            "points": points,
+            "total_pushups": pushups,
+            "next_level": next_title,
+            "points_to_next_level": (next_threshold - points) if next_threshold else None
+        })
+    except Exception as e:
+        print(f"Ошибка в api_profile: {e}")
+        return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
 
 
 async def api_leaderboard(request):
-    cursor.execute(
-        "SELECT username, total_points FROM users ORDER BY total_points DESC LIMIT 10"
-    )
-    rows = cursor.fetchall()
+    try:
+        cursor = get_cursor()
+        cursor.execute(
+            "SELECT username, total_points FROM users ORDER BY total_points DESC LIMIT 10"
+        )
+        rows = cursor.fetchall()
 
-    leaderboard = [
-        {"name": name or "Игрок", "points": points}
-        for name, points in rows
-    ]
+        leaderboard = [
+            {"name": name or "Игрок", "points": points}
+            for name, points in rows
+        ]
 
-    return web.json_response({"leaderboard": leaderboard})
+        return web.json_response({"leaderboard": leaderboard})
+    except Exception as e:
+        print(f"Ошибка в api_leaderboard: {e}")
+        return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
 
 
 async def api_health(request):
