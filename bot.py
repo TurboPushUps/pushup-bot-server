@@ -22,24 +22,38 @@ dp = Dispatcher()
 db = None
 
 
-def get_cursor():
+def connect_db():
     global db
-    try:
-        if db is None or db.closed:
-            raise psycopg2.OperationalError("Соединение закрыто")
-        cursor = db.cursor()
-        cursor.execute("SELECT 1")
-        return db.cursor()
-    except (psycopg2.OperationalError, psycopg2.InterfaceError):
-        print("Переподключаемся к базе данных...")
-        db = psycopg2.connect(DATABASE_URL)
-        db.autocommit = True
-        return db.cursor()
+    print("Подключаемся к базе данных...")
+    db = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+    db.autocommit = True
+
+
+def run_query(sql, params=None, fetchone=False, fetchall=False):
+    global db
+    for attempt in range(2):
+        try:
+            if db is None or db.closed:
+                connect_db()
+            cursor = db.cursor()
+            cursor.execute(sql, params or ())
+            if fetchone:
+                return cursor.fetchone()
+            if fetchall:
+                return cursor.fetchall()
+            return None
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+            print(f"Проблема с соединением (попытка {attempt + 1}): {e}")
+            try:
+                connect_db()
+            except Exception as reconnect_error:
+                print(f"Не удалось переподключиться: {reconnect_error}")
+                raise
+    raise psycopg2.OperationalError("Не удалось выполнить запрос после переподключения")
 
 
 def init_db():
-    cursor = get_cursor()
-    cursor.execute("""
+    run_query("""
     CREATE TABLE IF NOT EXISTS users (
         user_id BIGINT PRIMARY KEY,
         username TEXT,
@@ -48,33 +62,25 @@ def init_db():
         total_pushups INTEGER DEFAULT 0
     )
     """)
-    cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS nickname TEXT")
-    cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS total_plank_seconds INTEGER DEFAULT 0")
-    cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_pushups INTEGER DEFAULT 0")
-    cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_pushup_date DATE")
-    cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS pushup_streak INTEGER DEFAULT 0")
-    cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_plank_seconds INTEGER DEFAULT 0")
-    cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_plank_date DATE")
-    cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS plank_streak INTEGER DEFAULT 0")
+    run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS nickname TEXT")
+    run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS total_plank_seconds INTEGER DEFAULT 0")
+    run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_pushups INTEGER DEFAULT 0")
+    run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_pushup_date DATE")
+    run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS pushup_streak INTEGER DEFAULT 0")
+    run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_plank_seconds INTEGER DEFAULT 0")
+    run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_plank_date DATE")
+    run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS plank_streak INTEGER DEFAULT 0")
 
 
 init_db()
 
 
 def ensure_user_exists(user_id, username=None):
-    cursor = get_cursor()
-    cursor.execute("SELECT * FROM users WHERE user_id = %s", (user_id,))
-    user = cursor.fetchone()
+    user = run_query("SELECT * FROM users WHERE user_id = %s", (user_id,), fetchone=True)
     if user is None:
-        cursor.execute(
-            "INSERT INTO users (user_id, username) VALUES (%s, %s)",
-            (user_id, username)
-        )
+        run_query("INSERT INTO users (user_id, username) VALUES (%s, %s)", (user_id, username))
     elif username:
-        cursor.execute(
-            "UPDATE users SET username = %s WHERE user_id = %s",
-            (username, user_id)
-        )
+        run_query("UPDATE users SET username = %s WHERE user_id = %s", (username, user_id))
 
 
 BANNED_ROOTS = [
@@ -120,24 +126,16 @@ def get_next_level_info(points):
     return None, None
 
 
-def update_streak_and_daily(cursor, user_id, activity, amount):
-    """
-    activity: 'pushup' или 'plank'
-    amount: сколько добавить (штук или секунд)
-    Обновляет дневной счётчик и стрик по правилам:
-    - сегодня уже была активность -> просто прибавляем к дневному счётчику
-    - последняя активность была вчера -> стрик +1, дневной счётчик = amount
-    - активности не было или был пропуск -> стрик = 1, дневной счётчик = amount
-    """
+def update_streak_and_daily(user_id, activity, amount):
     daily_col = "daily_pushups" if activity == "pushup" else "daily_plank_seconds"
     date_col = "last_pushup_date" if activity == "pushup" else "last_plank_date"
     streak_col = "pushup_streak" if activity == "pushup" else "plank_streak"
 
-    cursor.execute(
+    row = run_query(
         f"SELECT {daily_col}, {date_col}, {streak_col}, CURRENT_DATE FROM users WHERE user_id = %s",
-        (user_id,)
+        (user_id,), fetchone=True
     )
-    daily_value, last_date, streak, today = cursor.fetchone()
+    daily_value, last_date, streak, today = row
 
     if last_date == today:
         new_daily = daily_value + amount
@@ -149,12 +147,10 @@ def update_streak_and_daily(cursor, user_id, activity, amount):
         new_daily = amount
         new_streak = 1
 
-    cursor.execute(
+    run_query(
         f"UPDATE users SET {daily_col} = %s, {date_col} = %s, {streak_col} = %s WHERE user_id = %s",
         (new_daily, today, new_streak, user_id)
     )
-
-    return new_daily, new_streak
 
 
 @dp.message(CommandStart())
@@ -186,8 +182,6 @@ async def start_handler(message: Message):
     )
 
 
-# ===== API ДЛЯ САЙТА =====
-
 async def api_user_status(request):
     user_id = request.query.get("user_id")
     if not user_id or not user_id.isdigit():
@@ -196,9 +190,7 @@ async def api_user_status(request):
     user_id = int(user_id)
     ensure_user_exists(user_id)
 
-    cursor = get_cursor()
-    cursor.execute("SELECT nickname FROM users WHERE user_id = %s", (user_id,))
-    row = cursor.fetchone()
+    row = run_query("SELECT nickname FROM users WHERE user_id = %s", (user_id,), fetchone=True)
     nickname = row[0] if row else None
 
     return web.json_response({
@@ -223,12 +215,7 @@ async def api_register_nickname(request):
             return web.json_response({"success": False, "error": error})
 
         ensure_user_exists(user_id)
-
-        cursor = get_cursor()
-        cursor.execute(
-            "UPDATE users SET nickname = %s WHERE user_id = %s",
-            (nickname.strip(), user_id)
-        )
+        run_query("UPDATE users SET nickname = %s WHERE user_id = %s", (nickname.strip(), user_id))
 
         return web.json_response({"success": True, "nickname": nickname.strip()})
 
@@ -247,23 +234,22 @@ async def api_profile(request):
     try:
         ensure_user_exists(user_id)
 
-        cursor = get_cursor()
-        cursor.execute("""
+        row = run_query("""
             SELECT total_points, total_pushups, total_plank_seconds,
                    daily_pushups, last_pushup_date, pushup_streak,
                    daily_plank_seconds, last_plank_date, plank_streak,
                    CURRENT_DATE
             FROM users WHERE user_id = %s
-        """, (user_id,))
+        """, (user_id,), fetchone=True)
+
         (points, total_pushups, total_plank_seconds,
          daily_pushups, last_pushup_date, pushup_streak,
          daily_plank_seconds, last_plank_date, plank_streak,
-         today) = cursor.fetchone()
+         today) = row
 
         pushups_today = daily_pushups if last_pushup_date == today else 0
         plank_today = daily_plank_seconds if last_plank_date == today else 0
 
-        # Если пропущен день (последняя активность не сегодня и не вчера) — стрик считаем сгоревшим для отображения
         pushup_streak_display = pushup_streak if last_pushup_date and (today - last_pushup_date).days <= 1 else 0
         plank_streak_display = plank_streak if last_plank_date and (today - last_plank_date).days <= 1 else 0
 
@@ -296,42 +282,37 @@ async def api_leaderboard(request):
     period = request.query.get("period", "total")
 
     try:
-        cursor = get_cursor()
-
         if activity == "pushup":
             if period == "today":
-                cursor.execute("""
+                rows = run_query("""
                     SELECT COALESCE(nickname, username, 'Игрок') AS name,
                            CASE WHEN last_pushup_date = CURRENT_DATE THEN daily_pushups ELSE 0 END AS value
                     FROM users
                     WHERE (last_pushup_date = CURRENT_DATE AND daily_pushups > 0)
                     ORDER BY value DESC LIMIT 10
-                """)
+                """, fetchall=True)
             else:
-                cursor.execute("""
+                rows = run_query("""
                     SELECT COALESCE(nickname, username, 'Игрок') AS name, total_pushups AS value
-                    FROM users
-                    WHERE total_pushups > 0
+                    FROM users WHERE total_pushups > 0
                     ORDER BY value DESC LIMIT 10
-                """)
+                """, fetchall=True)
         else:
             if period == "today":
-                cursor.execute("""
+                rows = run_query("""
                     SELECT COALESCE(nickname, username, 'Игрок') AS name,
                            CASE WHEN last_plank_date = CURRENT_DATE THEN daily_plank_seconds ELSE 0 END AS value
                     FROM users
                     WHERE (last_plank_date = CURRENT_DATE AND daily_plank_seconds > 0)
                     ORDER BY value DESC LIMIT 10
-                """)
+                """, fetchall=True)
             else:
-                cursor.execute("""
+                rows = run_query("""
                     SELECT COALESCE(nickname, username, 'Игрок') AS name, total_plank_seconds AS value
-                    FROM users
-                    WHERE total_plank_seconds > 0
+                    FROM users WHERE total_plank_seconds > 0
                     ORDER BY value DESC LIMIT 10
-                """)
+                """, fetchall=True)
 
-        rows = cursor.fetchall()
         leaderboard = [{"name": name, "value": value} for name, value in rows]
 
         return web.json_response({"leaderboard": leaderboard, "activity": activity, "period": period})
@@ -355,19 +336,15 @@ async def api_save_pushups(request):
 
         ensure_user_exists(user_id)
 
-        cursor = get_cursor()
-        cursor.execute("SELECT total_points FROM users WHERE user_id = %s", (user_id,))
-        (points_before,) = cursor.fetchone()
+        (points_before,) = run_query("SELECT total_points FROM users WHERE user_id = %s", (user_id,), fetchone=True)
         level_before = get_level(points_before)
 
-        cursor = get_cursor()
-        cursor.execute(
+        run_query(
             "UPDATE users SET total_points = total_points + %s, total_pushups = total_pushups + %s WHERE user_id = %s",
             (points_earned, count, user_id)
         )
 
-        cursor = get_cursor()
-        update_streak_and_daily(cursor, user_id, "pushup", count)
+        update_streak_and_daily(user_id, "pushup", count)
 
         points_after = points_before + points_earned
         level_after = get_level(points_after)
@@ -399,19 +376,15 @@ async def api_save_plank(request):
 
         ensure_user_exists(user_id)
 
-        cursor = get_cursor()
-        cursor.execute("SELECT total_points FROM users WHERE user_id = %s", (user_id,))
-        (points_before,) = cursor.fetchone()
+        (points_before,) = run_query("SELECT total_points FROM users WHERE user_id = %s", (user_id,), fetchone=True)
         level_before = get_level(points_before)
 
-        cursor = get_cursor()
-        cursor.execute(
+        run_query(
             "UPDATE users SET total_points = total_points + %s, total_plank_seconds = total_plank_seconds + %s WHERE user_id = %s",
             (points_earned, seconds, user_id)
         )
 
-        cursor = get_cursor()
-        update_streak_and_daily(cursor, user_id, "plank", seconds)
+        update_streak_and_daily(user_id, "plank", seconds)
 
         points_after = points_before + points_earned
         level_after = get_level(points_after)
@@ -429,7 +402,14 @@ async def api_save_plank(request):
 
 
 async def api_health(request):
-    return web.json_response({"status": "ok"})
+    try:
+        run_query("SELECT 1")
+        db_status = "ok"
+    except Exception as e:
+        print(f"Health check: база не отвечает: {e}")
+        db_status = "error"
+
+    return web.json_response({"status": "ok", "db": db_status})
 
 
 @web.middleware
