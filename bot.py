@@ -76,11 +76,18 @@ init_db()
 
 
 def ensure_user_exists(user_id, username=None):
-    user = run_query("SELECT * FROM users WHERE user_id = %s", (user_id,), fetchone=True)
-    if user is None:
-        run_query("INSERT INTO users (user_id, username) VALUES (%s, %s)", (user_id, username))
-    elif username:
-        run_query("UPDATE users SET username = %s WHERE user_id = %s", (username, user_id))
+    """Одним запросом создаёт пользователя, если его нет (или обновляет имя, если оно передано)."""
+    if username:
+        run_query(
+            "INSERT INTO users (user_id, username) VALUES (%s, %s) "
+            "ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username",
+            (user_id, username)
+        )
+    else:
+        run_query(
+            "INSERT INTO users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING",
+            (user_id,)
+        )
 
 
 BANNED_ROOTS = [
@@ -126,40 +133,13 @@ def get_next_level_info(points):
     return None, None
 
 
-def update_streak_and_daily(user_id, activity, amount):
-    daily_col = "daily_pushups" if activity == "pushup" else "daily_plank_seconds"
-    date_col = "last_pushup_date" if activity == "pushup" else "last_plank_date"
-    streak_col = "pushup_streak" if activity == "pushup" else "plank_streak"
-
-    row = run_query(
-        f"SELECT {daily_col}, {date_col}, {streak_col}, CURRENT_DATE FROM users WHERE user_id = %s",
-        (user_id,), fetchone=True
-    )
-    daily_value, last_date, streak, today = row
-
-    if last_date == today:
-        new_daily = daily_value + amount
-        new_streak = streak if streak else 1
-    elif last_date is not None and (today - last_date).days == 1:
-        new_daily = amount
-        new_streak = (streak or 0) + 1
-    else:
-        new_daily = amount
-        new_streak = 1
-
-    run_query(
-        f"UPDATE users SET {daily_col} = %s, {date_col} = %s, {streak_col} = %s WHERE user_id = %s",
-        (new_daily, today, new_streak, user_id)
-    )
-
-
 @dp.message(CommandStart())
 async def start_handler(message: Message):
     user_id = message.from_user.id
     username = message.from_user.first_name or message.from_user.username or "Игрок"
     ensure_user_exists(user_id, username)
 
-    personal_url = f"{WEBAPP_URL}?user_id={user_id}"
+    personal_url = f"{WEBAPP_URL}?user_id={user_id}&v=3"
 
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
@@ -214,8 +194,11 @@ async def api_register_nickname(request):
         if not valid:
             return web.json_response({"success": False, "error": error})
 
-        ensure_user_exists(user_id)
-        run_query("UPDATE users SET nickname = %s WHERE user_id = %s", (nickname.strip(), user_id))
+        run_query(
+            "INSERT INTO users (user_id, nickname) VALUES (%s, %s) "
+            "ON CONFLICT (user_id) DO UPDATE SET nickname = EXCLUDED.nickname",
+            (user_id, nickname.strip())
+        )
 
         return web.json_response({"success": True, "nickname": nickname.strip()})
 
@@ -336,17 +319,29 @@ async def api_save_pushups(request):
 
         ensure_user_exists(user_id)
 
-        (points_before,) = run_query("SELECT total_points FROM users WHERE user_id = %s", (user_id,), fetchone=True)
+        # ОДНИМ запросом: обновляем очки, отжимания, дневной счётчик и стрик,
+        # и сразу получаем очки "до" и "после" через RETURNING
+        row = run_query("""
+            UPDATE users
+            SET
+                total_points = total_points + %(points)s,
+                total_pushups = total_pushups + %(count)s,
+                daily_pushups = CASE
+                    WHEN last_pushup_date = CURRENT_DATE THEN daily_pushups + %(count)s
+                    ELSE %(count)s
+                END,
+                pushup_streak = CASE
+                    WHEN last_pushup_date = CURRENT_DATE THEN COALESCE(pushup_streak, 1)
+                    WHEN last_pushup_date = CURRENT_DATE - INTERVAL '1 day' THEN COALESCE(pushup_streak, 0) + 1
+                    ELSE 1
+                END,
+                last_pushup_date = CURRENT_DATE
+            WHERE user_id = %(user_id)s
+            RETURNING total_points - %(points)s AS points_before, total_points AS points_after
+        """, {"points": points_earned, "count": count, "user_id": user_id}, fetchone=True)
+
+        points_before, points_after = row
         level_before = get_level(points_before)
-
-        run_query(
-            "UPDATE users SET total_points = total_points + %s, total_pushups = total_pushups + %s WHERE user_id = %s",
-            (points_earned, count, user_id)
-        )
-
-        update_streak_and_daily(user_id, "pushup", count)
-
-        points_after = points_before + points_earned
         level_after = get_level(points_after)
 
         return web.json_response({
@@ -376,17 +371,27 @@ async def api_save_plank(request):
 
         ensure_user_exists(user_id)
 
-        (points_before,) = run_query("SELECT total_points FROM users WHERE user_id = %s", (user_id,), fetchone=True)
+        row = run_query("""
+            UPDATE users
+            SET
+                total_points = total_points + %(points)s,
+                total_plank_seconds = total_plank_seconds + %(seconds)s,
+                daily_plank_seconds = CASE
+                    WHEN last_plank_date = CURRENT_DATE THEN daily_plank_seconds + %(seconds)s
+                    ELSE %(seconds)s
+                END,
+                plank_streak = CASE
+                    WHEN last_plank_date = CURRENT_DATE THEN COALESCE(plank_streak, 1)
+                    WHEN last_plank_date = CURRENT_DATE - INTERVAL '1 day' THEN COALESCE(plank_streak, 0) + 1
+                    ELSE 1
+                END,
+                last_plank_date = CURRENT_DATE
+            WHERE user_id = %(user_id)s
+            RETURNING total_points - %(points)s AS points_before, total_points AS points_after
+        """, {"points": points_earned, "seconds": seconds, "user_id": user_id}, fetchone=True)
+
+        points_before, points_after = row
         level_before = get_level(points_before)
-
-        run_query(
-            "UPDATE users SET total_points = total_points + %s, total_plank_seconds = total_plank_seconds + %s WHERE user_id = %s",
-            (points_earned, seconds, user_id)
-        )
-
-        update_streak_and_daily(user_id, "plank", seconds)
-
-        points_after = points_before + points_earned
         level_after = get_level(points_after)
 
         return web.json_response({
