@@ -301,28 +301,34 @@ async def api_leaderboard(request):
         if activity == "pushup":
             if period == "today":
                 cursor.execute("""
-                    SELECT COALESCE(nickname, username, 'Игрок'),
+                    SELECT COALESCE(nickname, username, 'Игрок') AS name,
                            CASE WHEN last_pushup_date = CURRENT_DATE THEN daily_pushups ELSE 0 END AS value
-                    FROM users ORDER BY value DESC LIMIT 10
+                    FROM users
+                    WHERE (last_pushup_date = CURRENT_DATE AND daily_pushups > 0)
+                    ORDER BY value DESC LIMIT 10
                 """)
-                unit = ""
             else:
                 cursor.execute("""
-                    SELECT COALESCE(nickname, username, 'Игрок'), total_pushups AS value
-                    FROM users ORDER BY value DESC LIMIT 10
+                    SELECT COALESCE(nickname, username, 'Игрок') AS name, total_pushups AS value
+                    FROM users
+                    WHERE total_pushups > 0
+                    ORDER BY value DESC LIMIT 10
                 """)
-                unit = ""
         else:
             if period == "today":
                 cursor.execute("""
-                    SELECT COALESCE(nickname, username, 'Игрок'),
+                    SELECT COALESCE(nickname, username, 'Игрок') AS name,
                            CASE WHEN last_plank_date = CURRENT_DATE THEN daily_plank_seconds ELSE 0 END AS value
-                    FROM users ORDER BY value DESC LIMIT 10
+                    FROM users
+                    WHERE (last_plank_date = CURRENT_DATE AND daily_plank_seconds > 0)
+                    ORDER BY value DESC LIMIT 10
                 """)
             else:
                 cursor.execute("""
-                    SELECT COALESCE(nickname, username, 'Игрок'), total_plank_seconds AS value
-                    FROM users ORDER BY value DESC LIMIT 10
+                    SELECT COALESCE(nickname, username, 'Игрок') AS name, total_plank_seconds AS value
+                    FROM users
+                    WHERE total_plank_seconds > 0
+                    ORDER BY value DESC LIMIT 10
                 """)
 
         rows = cursor.fetchall()
