@@ -134,37 +134,13 @@ def get_next_level_info(points):
     return None, None
 
 
-def update_streak_and_daily(user_id, activity, amount):
-    daily_col = "daily_pushups" if activity == "pushup" else "daily_plank_seconds"
-    date_col = "last_pushup_date" if activity == "pushup" else "last_plank_date"
-    streak_col = "pushup_streak" if activity == "pushup" else "plank_streak"
+# ===== ПОДЗЕМЕЛЬЯ =====
 
-    run_query(f"""
-        UPDATE users
-        SET
-            {daily_col} = CASE
-                WHEN {date_col} = CURRENT_DATE THEN {daily_col} + %(amount)s
-                ELSE %(amount)s
-            END,
-            {streak_col} = CASE
-                WHEN {date_col} = CURRENT_DATE THEN COALESCE({streak_col}, 1)
-                WHEN {date_col} = CURRENT_DATE - INTERVAL '1 day' THEN COALESCE({streak_col}, 0) + 1
-                ELSE 1
-            END,
-            {date_col} = CURRENT_DATE
-        WHERE user_id = %(user_id)s
-    """, {"amount": amount, "user_id": user_id})
+MAX_DUNGEON = 35
 
-
-# ===== СИСТЕМА ПОДЗЕМЕЛИЙ =====
-
-MAX_DUNGEON = 35  # потолок сложности
-
-# Контрольные точки: номер подземелья -> суммарный урон, нужный чтобы его пройти
 PUSHUP_MILESTONES = {0: 10, 5: 30, 10: 50, 15: 80, 20: 100, 25: 150, 30: 200, 35: 300}
 PLANK_MILESTONES = {0: 8, 5: 20, 10: 40, 15: 60, 20: 90, 25: 120, 30: 360, 35: 600}
 
-# Диапазоны подземелий -> количество обычных врагов
 ENEMY_COUNT_SEGMENTS = [
     (1, 4, 3), (6, 9, 4), (11, 14, 5), (16, 19, 6),
     (21, 24, 7), (26, 29, 8), (31, 34, 9)
@@ -174,27 +150,23 @@ ENEMY_COUNT_SEGMENTS = [
 def get_milestone_total(activity, n):
     milestones = PUSHUP_MILESTONES if activity == "pushup" else PLANK_MILESTONES
     keys = sorted(milestones.keys())
-
     if n >= keys[-1]:
         return milestones[keys[-1]]
-
     lower = max(k for k in keys if k <= n)
     upper = min(k for k in keys if k >= n)
-
     if lower == upper:
         return milestones[lower]
-
     fraction = (n - lower) / (upper - lower)
     return milestones[lower] + fraction * (milestones[upper] - milestones[lower])
 
 
 def get_enemy_count(n):
     if n % 5 == 0 and n > 0:
-        return 1  # босс — всегда один враг
+        return 1
     for lo, hi, count in ENEMY_COUNT_SEGMENTS:
         if lo <= n <= hi:
             return count
-    return 9  # запасной вариант (не должен использоваться при потолке в 35)
+    return 9
 
 
 def generate_dungeon(activity, n):
@@ -205,8 +177,6 @@ def generate_dungeon(activity, n):
 
     hp_each = max(1, round(total / enemy_count))
     enemies = [hp_each] * enemy_count
-
-    # Корректируем округление, чтобы сумма точно совпадала с total
     diff = round(total) - sum(enemies)
     enemies[-1] += diff
 
@@ -224,7 +194,7 @@ async def start_handler(message: Message):
     username = message.from_user.first_name or message.from_user.username or "Игрок"
     ensure_user_exists(user_id, username)
 
-    personal_url = f"{WEBAPP_URL}?user_id={user_id}&v=4"
+    personal_url = f"{WEBAPP_URL}?user_id={user_id}&v=5"
 
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
@@ -246,8 +216,6 @@ async def start_handler(message: Message):
         reply_markup=keyboard
     )
 
-
-# ===== API: ОБЩЕЕ =====
 
 async def api_user_status(request):
     user_id = request.query.get("user_id")
@@ -408,17 +376,26 @@ async def api_save_pushups(request):
         count = int(count)
         points_earned = count * 10
 
-        ensure_user_exists(user_id)
-
+        # ОДНИМ запросом: создаём пользователя (если нет), обновляем очки,
+        # отжимания, дневной счётчик и стрик — всё сразу через INSERT ... ON CONFLICT
         row = run_query("""
-            UPDATE users
-            SET total_points = total_points + %(points)s,
-                total_pushups = total_pushups + %(count)s
-            WHERE user_id = %(user_id)s
+            INSERT INTO users (user_id, total_points, total_pushups, daily_pushups, last_pushup_date, pushup_streak)
+            VALUES (%(user_id)s, %(points)s, %(count)s, %(count)s, CURRENT_DATE, 1)
+            ON CONFLICT (user_id) DO UPDATE SET
+                total_points = users.total_points + %(points)s,
+                total_pushups = users.total_pushups + %(count)s,
+                daily_pushups = CASE
+                    WHEN users.last_pushup_date = CURRENT_DATE THEN users.daily_pushups + %(count)s
+                    ELSE %(count)s
+                END,
+                pushup_streak = CASE
+                    WHEN users.last_pushup_date = CURRENT_DATE THEN COALESCE(users.pushup_streak, 1)
+                    WHEN users.last_pushup_date = CURRENT_DATE - INTERVAL '1 day' THEN COALESCE(users.pushup_streak, 0) + 1
+                    ELSE 1
+                END,
+                last_pushup_date = CURRENT_DATE
             RETURNING total_points - %(points)s AS points_before, total_points AS points_after
         """, {"points": points_earned, "count": count, "user_id": user_id}, fetchone=True)
-
-        update_streak_and_daily(user_id, "pushup", count)
 
         points_before, points_after = row
         level_before = get_level(points_before)
@@ -449,17 +426,24 @@ async def api_save_plank(request):
         seconds = int(seconds)
         points_earned = seconds * 2
 
-        ensure_user_exists(user_id)
-
         row = run_query("""
-            UPDATE users
-            SET total_points = total_points + %(points)s,
-                total_plank_seconds = total_plank_seconds + %(seconds)s
-            WHERE user_id = %(user_id)s
+            INSERT INTO users (user_id, total_points, total_plank_seconds, daily_plank_seconds, last_plank_date, plank_streak)
+            VALUES (%(user_id)s, %(points)s, %(seconds)s, %(seconds)s, CURRENT_DATE, 1)
+            ON CONFLICT (user_id) DO UPDATE SET
+                total_points = users.total_points + %(points)s,
+                total_plank_seconds = users.total_plank_seconds + %(seconds)s,
+                daily_plank_seconds = CASE
+                    WHEN users.last_plank_date = CURRENT_DATE THEN users.daily_plank_seconds + %(seconds)s
+                    ELSE %(seconds)s
+                END,
+                plank_streak = CASE
+                    WHEN users.last_plank_date = CURRENT_DATE THEN COALESCE(users.plank_streak, 1)
+                    WHEN users.last_plank_date = CURRENT_DATE - INTERVAL '1 day' THEN COALESCE(users.plank_streak, 0) + 1
+                    ELSE 1
+                END,
+                last_plank_date = CURRENT_DATE
             RETURNING total_points - %(points)s AS points_before, total_points AS points_after
         """, {"points": points_earned, "seconds": seconds, "user_id": user_id}, fetchone=True)
-
-        update_streak_and_daily(user_id, "plank", seconds)
 
         points_before, points_after = row
         level_before = get_level(points_before)
@@ -477,13 +461,7 @@ async def api_save_plank(request):
         return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
 
 
-# ===== API: ПОДЗЕМЕЛЬЯ =====
-
 async def api_dungeon_info(request):
-    """
-    Возвращает данные подземелья для боя: список HP врагов, номер подземелья, награду.
-    Параметры: user_id, activity (pushup/plank), dungeon (опционально — если не указан, берём текущий открытый).
-    """
     user_id = request.query.get("user_id")
     activity = request.query.get("activity")
 
@@ -498,7 +476,7 @@ async def api_dungeon_info(request):
 
     requested = request.query.get("dungeon")
     dungeon_n = int(requested) if requested and requested.isdigit() else current_dungeon
-    dungeon_n = min(max(dungeon_n, 1), current_dungeon)  # нельзя запросить ещё не открытое подземелье
+    dungeon_n = min(max(dungeon_n, 1), current_dungeon)
 
     dungeon_data = generate_dungeon(activity, dungeon_n)
     is_replay = dungeon_n < current_dungeon
@@ -515,10 +493,6 @@ async def api_dungeon_info(request):
 
 
 async def api_dungeon_complete(request):
-    """
-    Вызывается, когда пользователь побеждает всех врагов подземелья.
-    Начисляет XP и, если это было текущее (не повторное) подземелье — открывает следующее.
-    """
     try:
         data = await request.json()
         user_id = data.get("user_id")
