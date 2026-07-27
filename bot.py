@@ -1,5 +1,6 @@
 import os
 import re
+import asyncio
 import psycopg2
 from aiohttp import web
 from aiogram import Bot, Dispatcher
@@ -52,6 +53,11 @@ def run_query(sql, params=None, fetchone=False, fetchall=False):
     raise psycopg2.OperationalError("Не удалось выполнить запрос после переподключения")
 
 
+async def db_query(sql, params=None, fetchone=False, fetchall=False):
+    """Выполняет запрос к базе в отдельном потоке, чтобы не блокировать сервер целиком."""
+    return await asyncio.to_thread(run_query, sql, params, fetchone, fetchall)
+
+
 def init_db():
     run_query("""
     CREATE TABLE IF NOT EXISTS users (
@@ -77,15 +83,15 @@ def init_db():
 init_db()
 
 
-def ensure_user_exists(user_id, username=None):
+async def ensure_user_exists(user_id, username=None):
     if username:
-        run_query(
+        await db_query(
             "INSERT INTO users (user_id, username) VALUES (%s, %s) "
             "ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username",
             (user_id, username)
         )
     else:
-        run_query(
+        await db_query(
             "INSERT INTO users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING",
             (user_id,)
         )
@@ -134,7 +140,7 @@ def get_next_level_info(points):
     return None, None
 
 
-# ===== ПОДЗЕМЕЛЬЯ =====
+# ===== ПРИКЛЮЧЕНИЯ (внутри — те же "подземелья", просто новое название для пользователя) =====
 
 MAX_DUNGEON = 35
 
@@ -192,9 +198,9 @@ def generate_dungeon(activity, n):
 async def start_handler(message: Message):
     user_id = message.from_user.id
     username = message.from_user.first_name or message.from_user.username or "Игрок"
-    ensure_user_exists(user_id, username)
+    await ensure_user_exists(user_id, username)
 
-    personal_url = f"{WEBAPP_URL}?user_id={user_id}&v=5"
+    personal_url = f"{WEBAPP_URL}?user_id={user_id}&v=6"
 
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
@@ -209,7 +215,7 @@ async def start_handler(message: Message):
     await message.answer(
         "💪 Добро пожаловать!\n\n"
         "Здесь твои тренировки превращаются в награды.\n\n"
-        "📹 Проходи подземелья или тренируйся свободно перед камерой — бот автоматически всё засчитает.\n"
+        "📹 Проходи режим приключений или тренируйся свободно перед камерой — бот автоматически всё засчитает.\n"
         "🏆 Получай внутриигровую валюту и ценные награды.\n"
         "📈 Прокачивай своего персонажа, открывай новые уровни и достижения.\n"
         "🥇 Соревнуйся с другими игроками и поднимайся в таблице лидеров.",
@@ -217,15 +223,20 @@ async def start_handler(message: Message):
     )
 
 
+# ===== API =====
+
 async def api_user_status(request):
     user_id = request.query.get("user_id")
     if not user_id or not user_id.isdigit():
         return web.json_response({"error": "user_id обязателен"}, status=400)
 
     user_id = int(user_id)
-    ensure_user_exists(user_id)
 
-    row = run_query("SELECT nickname FROM users WHERE user_id = %s", (user_id,), fetchone=True)
+    row = await db_query("""
+        INSERT INTO users (user_id) VALUES (%s)
+        ON CONFLICT (user_id) DO UPDATE SET user_id = EXCLUDED.user_id
+        RETURNING nickname
+    """, (user_id,), fetchone=True)
     nickname = row[0] if row else None
 
     return web.json_response({
@@ -249,7 +260,7 @@ async def api_register_nickname(request):
         if not valid:
             return web.json_response({"success": False, "error": error})
 
-        run_query(
+        await db_query(
             "INSERT INTO users (user_id, nickname) VALUES (%s, %s) "
             "ON CONFLICT (user_id) DO UPDATE SET nickname = EXCLUDED.nickname",
             (user_id, nickname.strip())
@@ -270,16 +281,14 @@ async def api_profile(request):
     user_id = int(user_id)
 
     try:
-        ensure_user_exists(user_id)
-
-        row = run_query("""
-            SELECT total_points, total_pushups, total_plank_seconds,
-                   daily_pushups, last_pushup_date, pushup_streak,
-                   daily_plank_seconds, last_plank_date, plank_streak,
-                   pushup_dungeon, plank_dungeon,
-                   CURRENT_DATE
-            FROM users WHERE user_id = %s
-        """, (user_id,), fetchone=True)
+        row = await db_query("""
+            INSERT INTO users (user_id) VALUES (%(user_id)s)
+            ON CONFLICT (user_id) DO UPDATE SET user_id = EXCLUDED.user_id
+            RETURNING total_points, total_pushups, total_plank_seconds,
+                      daily_pushups, last_pushup_date, pushup_streak,
+                      daily_plank_seconds, last_plank_date, plank_streak,
+                      pushup_dungeon, plank_dungeon, CURRENT_DATE
+        """, {"user_id": user_id}, fetchone=True)
 
         (points, total_pushups, total_plank_seconds,
          daily_pushups, last_pushup_date, pushup_streak,
@@ -326,7 +335,7 @@ async def api_leaderboard(request):
     try:
         if activity == "pushup":
             if period == "today":
-                rows = run_query("""
+                rows = await db_query("""
                     SELECT COALESCE(nickname, username, 'Игрок') AS name,
                            CASE WHEN last_pushup_date = CURRENT_DATE THEN daily_pushups ELSE 0 END AS value
                     FROM users
@@ -334,14 +343,14 @@ async def api_leaderboard(request):
                     ORDER BY value DESC LIMIT 10
                 """, fetchall=True)
             else:
-                rows = run_query("""
+                rows = await db_query("""
                     SELECT COALESCE(nickname, username, 'Игрок') AS name, total_pushups AS value
                     FROM users WHERE total_pushups > 0
                     ORDER BY value DESC LIMIT 10
                 """, fetchall=True)
         else:
             if period == "today":
-                rows = run_query("""
+                rows = await db_query("""
                     SELECT COALESCE(nickname, username, 'Игрок') AS name,
                            CASE WHEN last_plank_date = CURRENT_DATE THEN daily_plank_seconds ELSE 0 END AS value
                     FROM users
@@ -349,7 +358,7 @@ async def api_leaderboard(request):
                     ORDER BY value DESC LIMIT 10
                 """, fetchall=True)
             else:
-                rows = run_query("""
+                rows = await db_query("""
                     SELECT COALESCE(nickname, username, 'Игрок') AS name, total_plank_seconds AS value
                     FROM users WHERE total_plank_seconds > 0
                     ORDER BY value DESC LIMIT 10
@@ -376,9 +385,7 @@ async def api_save_pushups(request):
         count = int(count)
         points_earned = count * 10
 
-        # ОДНИМ запросом: создаём пользователя (если нет), обновляем очки,
-        # отжимания, дневной счётчик и стрик — всё сразу через INSERT ... ON CONFLICT
-        row = run_query("""
+        row = await db_query("""
             INSERT INTO users (user_id, total_points, total_pushups, daily_pushups, last_pushup_date, pushup_streak)
             VALUES (%(user_id)s, %(points)s, %(count)s, %(count)s, CURRENT_DATE, 1)
             ON CONFLICT (user_id) DO UPDATE SET
@@ -426,7 +433,7 @@ async def api_save_plank(request):
         seconds = int(seconds)
         points_earned = seconds * 2
 
-        row = run_query("""
+        row = await db_query("""
             INSERT INTO users (user_id, total_points, total_plank_seconds, daily_plank_seconds, last_plank_date, plank_streak)
             VALUES (%(user_id)s, %(points)s, %(seconds)s, %(seconds)s, CURRENT_DATE, 1)
             ON CONFLICT (user_id) DO UPDATE SET
@@ -469,10 +476,14 @@ async def api_dungeon_info(request):
         return web.json_response({"error": "Некорректные параметры"}, status=400)
 
     user_id = int(user_id)
-    ensure_user_exists(user_id)
-
     dungeon_col = "pushup_dungeon" if activity == "pushup" else "plank_dungeon"
-    (current_dungeon,) = run_query(f"SELECT {dungeon_col} FROM users WHERE user_id = %s", (user_id,), fetchone=True)
+
+    row = await db_query(f"""
+        INSERT INTO users (user_id) VALUES (%(user_id)s)
+        ON CONFLICT (user_id) DO UPDATE SET user_id = EXCLUDED.user_id
+        RETURNING {dungeon_col}
+    """, {"user_id": user_id}, fetchone=True)
+    (current_dungeon,) = row
 
     requested = request.query.get("dungeon")
     dungeon_n = int(requested) if requested and requested.isdigit() else current_dungeon
@@ -505,30 +516,34 @@ async def api_dungeon_complete(request):
         user_id = int(user_id)
         dungeon_n = int(dungeon_n)
 
-        ensure_user_exists(user_id)
-
         dungeon_col = "pushup_dungeon" if activity == "pushup" else "plank_dungeon"
-        (current_dungeon,) = run_query(f"SELECT {dungeon_col} FROM users WHERE user_id = %s", (user_id,), fetchone=True)
+
+        row = await db_query(f"""
+            INSERT INTO users (user_id) VALUES (%(user_id)s)
+            ON CONFLICT (user_id) DO UPDATE SET user_id = EXCLUDED.user_id
+            RETURNING {dungeon_col}
+        """, {"user_id": user_id}, fetchone=True)
+        (current_dungeon,) = row
 
         dungeon_data = generate_dungeon(activity, dungeon_n)
         is_replay = dungeon_n < current_dungeon
         xp_reward = dungeon_data["xp_reward"] if not is_replay else dungeon_data["xp_reward"] // 2
 
-        row = run_query("""
+        points_row = await db_query("""
             UPDATE users
             SET total_points = total_points + %(xp)s
             WHERE user_id = %(user_id)s
             RETURNING total_points - %(xp)s AS points_before, total_points AS points_after
         """, {"xp": xp_reward, "user_id": user_id}, fetchone=True)
 
-        points_before, points_after = row
+        points_before, points_after = points_row
         level_before = get_level(points_before)
         level_after = get_level(points_after)
 
         new_dungeon = current_dungeon
         if not is_replay and current_dungeon < MAX_DUNGEON:
             new_dungeon = current_dungeon + 1
-            run_query(f"UPDATE users SET {dungeon_col} = %s WHERE user_id = %s", (new_dungeon, user_id))
+            await db_query(f"UPDATE users SET {dungeon_col} = %s WHERE user_id = %s", (new_dungeon, user_id))
 
         return web.json_response({
             "success": True,
@@ -546,7 +561,7 @@ async def api_dungeon_complete(request):
 
 async def api_health(request):
     try:
-        run_query("SELECT 1")
+        await db_query("SELECT 1")
         db_status = "ok"
     except Exception as e:
         print(f"Health check: база не отвечает: {e}")
