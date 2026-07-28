@@ -54,7 +54,6 @@ def run_query(sql, params=None, fetchone=False, fetchall=False):
 
 
 async def db_query(sql, params=None, fetchone=False, fetchall=False):
-    """Выполняет запрос к базе в отдельном потоке, чтобы не блокировать сервер целиком."""
     return await asyncio.to_thread(run_query, sql, params, fetchone, fetchall)
 
 
@@ -78,6 +77,8 @@ def init_db():
     run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS plank_streak INTEGER DEFAULT 0")
     run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS pushup_dungeon INTEGER DEFAULT 1")
     run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS plank_dungeon INTEGER DEFAULT 1")
+    run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS pushup_best_streak INTEGER DEFAULT 0")
+    run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS plank_best_streak INTEGER DEFAULT 0")
 
 
 init_db()
@@ -140,8 +141,6 @@ def get_next_level_info(points):
     return None, None
 
 
-# ===== ПРИКЛЮЧЕНИЯ (внутри — те же "подземелья", просто новое название для пользователя) =====
-
 MAX_DUNGEON = 35
 
 PUSHUP_MILESTONES = {0: 10, 5: 30, 10: 50, 15: 80, 20: 100, 25: 150, 30: 200, 35: 300}
@@ -200,7 +199,7 @@ async def start_handler(message: Message):
     username = message.from_user.first_name or message.from_user.username or "Игрок"
     await ensure_user_exists(user_id, username)
 
-    personal_url = f"{WEBAPP_URL}?user_id={user_id}&v=6"
+    personal_url = f"{WEBAPP_URL}?user_id={user_id}&v=7"
 
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
@@ -222,8 +221,6 @@ async def start_handler(message: Message):
         reply_markup=keyboard
     )
 
-
-# ===== API =====
 
 async def api_user_status(request):
     user_id = request.query.get("user_id")
@@ -285,14 +282,14 @@ async def api_profile(request):
             INSERT INTO users (user_id) VALUES (%(user_id)s)
             ON CONFLICT (user_id) DO UPDATE SET user_id = EXCLUDED.user_id
             RETURNING total_points, total_pushups, total_plank_seconds,
-                      daily_pushups, last_pushup_date, pushup_streak,
-                      daily_plank_seconds, last_plank_date, plank_streak,
+                      daily_pushups, last_pushup_date, pushup_streak, pushup_best_streak,
+                      daily_plank_seconds, last_plank_date, plank_streak, plank_best_streak,
                       pushup_dungeon, plank_dungeon, CURRENT_DATE
         """, {"user_id": user_id}, fetchone=True)
 
         (points, total_pushups, total_plank_seconds,
-         daily_pushups, last_pushup_date, pushup_streak,
-         daily_plank_seconds, last_plank_date, plank_streak,
+         daily_pushups, last_pushup_date, pushup_streak, pushup_best_streak,
+         daily_plank_seconds, last_plank_date, plank_streak, plank_best_streak,
          pushup_dungeon, plank_dungeon,
          today) = row
 
@@ -313,12 +310,14 @@ async def api_profile(request):
             "pushup": {
                 "today": pushups_today,
                 "streak": pushup_streak_display,
+                "best_streak": pushup_best_streak or 0,
                 "total": total_pushups,
                 "dungeon": pushup_dungeon
             },
             "plank": {
                 "today_seconds": plank_today,
                 "streak": plank_streak_display,
+                "best_streak": plank_best_streak or 0,
                 "total_seconds": total_plank_seconds,
                 "dungeon": plank_dungeon
             }
@@ -386,8 +385,8 @@ async def api_save_pushups(request):
         points_earned = count * 10
 
         row = await db_query("""
-            INSERT INTO users (user_id, total_points, total_pushups, daily_pushups, last_pushup_date, pushup_streak)
-            VALUES (%(user_id)s, %(points)s, %(count)s, %(count)s, CURRENT_DATE, 1)
+            INSERT INTO users (user_id, total_points, total_pushups, daily_pushups, last_pushup_date, pushup_streak, pushup_best_streak)
+            VALUES (%(user_id)s, %(points)s, %(count)s, %(count)s, CURRENT_DATE, 1, 1)
             ON CONFLICT (user_id) DO UPDATE SET
                 total_points = users.total_points + %(points)s,
                 total_pushups = users.total_pushups + %(count)s,
@@ -400,6 +399,14 @@ async def api_save_pushups(request):
                     WHEN users.last_pushup_date = CURRENT_DATE - INTERVAL '1 day' THEN COALESCE(users.pushup_streak, 0) + 1
                     ELSE 1
                 END,
+                pushup_best_streak = GREATEST(
+                    COALESCE(users.pushup_best_streak, 0),
+                    CASE
+                        WHEN users.last_pushup_date = CURRENT_DATE THEN COALESCE(users.pushup_streak, 1)
+                        WHEN users.last_pushup_date = CURRENT_DATE - INTERVAL '1 day' THEN COALESCE(users.pushup_streak, 0) + 1
+                        ELSE 1
+                    END
+                ),
                 last_pushup_date = CURRENT_DATE
             RETURNING total_points - %(points)s AS points_before, total_points AS points_after
         """, {"points": points_earned, "count": count, "user_id": user_id}, fetchone=True)
@@ -434,8 +441,8 @@ async def api_save_plank(request):
         points_earned = seconds * 2
 
         row = await db_query("""
-            INSERT INTO users (user_id, total_points, total_plank_seconds, daily_plank_seconds, last_plank_date, plank_streak)
-            VALUES (%(user_id)s, %(points)s, %(seconds)s, %(seconds)s, CURRENT_DATE, 1)
+            INSERT INTO users (user_id, total_points, total_plank_seconds, daily_plank_seconds, last_plank_date, plank_streak, plank_best_streak)
+            VALUES (%(user_id)s, %(points)s, %(seconds)s, %(seconds)s, CURRENT_DATE, 1, 1)
             ON CONFLICT (user_id) DO UPDATE SET
                 total_points = users.total_points + %(points)s,
                 total_plank_seconds = users.total_plank_seconds + %(seconds)s,
@@ -448,6 +455,14 @@ async def api_save_plank(request):
                     WHEN users.last_plank_date = CURRENT_DATE - INTERVAL '1 day' THEN COALESCE(users.plank_streak, 0) + 1
                     ELSE 1
                 END,
+                plank_best_streak = GREATEST(
+                    COALESCE(users.plank_best_streak, 0),
+                    CASE
+                        WHEN users.last_plank_date = CURRENT_DATE THEN COALESCE(users.plank_streak, 1)
+                        WHEN users.last_plank_date = CURRENT_DATE - INTERVAL '1 day' THEN COALESCE(users.plank_streak, 0) + 1
+                        ELSE 1
+                    END
+                ),
                 last_plank_date = CURRENT_DATE
             RETURNING total_points - %(points)s AS points_before, total_points AS points_after
         """, {"points": points_earned, "seconds": seconds, "user_id": user_id}, fetchone=True)
