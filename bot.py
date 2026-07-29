@@ -604,6 +604,37 @@ async def api_reset_progress(request):
     except Exception as e:
         print(f"Ошибка в api_reset_progress: {e}")
         return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
+        async def api_reset_progress(request):
+    try:
+        data = await request.json()
+        user_id = data.get("user_id")
+        if not user_id:
+            return web.json_response({"error": "user_id обязателен"}, status=400)
+
+        user_id = int(user_id)
+
+        await db_query("""
+            UPDATE users SET
+                total_points = 0,
+                total_pushups = 0,
+                total_plank_seconds = 0,
+                daily_pushups = 0,
+                daily_plank_seconds = 0,
+                last_pushup_date = NULL,
+                last_plank_date = NULL,
+                pushup_streak = 0,
+                plank_streak = 0,
+                pushup_best_streak = 0,
+                plank_best_streak = 0,
+                pushup_dungeon = 1,
+                plank_dungeon = 1
+            WHERE user_id = %s
+        """, (user_id,))
+
+        return web.json_response({"success": True})
+    except Exception as e:
+        print(f"Ошибка в api_reset_progress: {e}")
+        return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
 async def api_health(request):
     try:
         await db_query("SELECT 1")
