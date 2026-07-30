@@ -54,6 +54,7 @@ def run_query(sql, params=None, fetchone=False, fetchall=False):
 
 
 async def db_query(sql, params=None, fetchone=False, fetchall=False):
+    """Выполняет запрос к базе в отдельном потоке, чтобы не блокировать сервер целиком."""
     return await asyncio.to_thread(run_query, sql, params, fetchone, fetchall)
 
 
@@ -199,7 +200,7 @@ async def start_handler(message: Message):
     username = message.from_user.first_name or message.from_user.username or "Игрок"
     await ensure_user_exists(user_id, username)
 
-    personal_url = f"{WEBAPP_URL}?user_id={user_id}&v=7"
+    personal_url = f"{WEBAPP_URL}?user_id={user_id}&v=8"
 
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
@@ -221,6 +222,8 @@ async def start_handler(message: Message):
         reply_markup=keyboard
     )
 
+
+# ===== API =====
 
 async def api_user_status(request):
     user_id = request.query.get("user_id")
@@ -573,6 +576,7 @@ async def api_dungeon_complete(request):
         print(f"Ошибка в api_dungeon_complete: {e}")
         return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
 
+
 async def api_reset_progress(request):
     try:
         data = await request.json()
@@ -604,37 +608,8 @@ async def api_reset_progress(request):
     except Exception as e:
         print(f"Ошибка в api_reset_progress: {e}")
         return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
-        async def api_reset_progress(request):
-    try:
-        data = await request.json()
-        user_id = data.get("user_id")
-        if not user_id:
-            return web.json_response({"error": "user_id обязателен"}, status=400)
 
-        user_id = int(user_id)
 
-        await db_query("""
-            UPDATE users SET
-                total_points = 0,
-                total_pushups = 0,
-                total_plank_seconds = 0,
-                daily_pushups = 0,
-                daily_plank_seconds = 0,
-                last_pushup_date = NULL,
-                last_plank_date = NULL,
-                pushup_streak = 0,
-                plank_streak = 0,
-                pushup_best_streak = 0,
-                plank_best_streak = 0,
-                pushup_dungeon = 1,
-                plank_dungeon = 1
-            WHERE user_id = %s
-        """, (user_id,))
-
-        return web.json_response({"success": True})
-    except Exception as e:
-        print(f"Ошибка в api_reset_progress: {e}")
-        return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
 async def api_health(request):
     try:
         await db_query("SELECT 1")
