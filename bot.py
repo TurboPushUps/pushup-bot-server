@@ -54,7 +54,6 @@ def run_query(sql, params=None, fetchone=False, fetchall=False):
 
 
 async def db_query(sql, params=None, fetchone=False, fetchall=False):
-    """Выполняет запрос к базе в отдельном потоке, чтобы не блокировать сервер целиком."""
     return await asyncio.to_thread(run_query, sql, params, fetchone, fetchall)
 
 
@@ -142,55 +141,62 @@ def get_next_level_info(points):
     return None, None
 
 
-MAX_DUNGEON = 35
+# ===== ПОДЗЕМЕЛЬЯ: КАЖДАЯ ЗОНА = ОДИН УРОВЕНЬ, БОСС = СЛЕДУЮЩИЙ ОТДЕЛЬНЫЙ УРОВЕНЬ =====
+# Формат каждого элемента: (количество врагов, суммарный HP на всех врагов зоны)
 
-PUSHUP_MILESTONES = {0: 10, 5: 30, 10: 50, 15: 80, 20: 100, 25: 150, 30: 200, 35: 300}
-PLANK_MILESTONES = {0: 8, 5: 20, 10: 40, 15: 60, 20: 90, 25: 120, 30: 360, 35: 600}
-
-ENEMY_COUNT_SEGMENTS = [
-    (1, 4, 3), (6, 9, 4), (11, 14, 5), (16, 19, 6),
-    (21, 24, 7), (26, 29, 8), (31, 34, 9)
+PUSHUP_ZONES = [
+    (3, 15),    # 1: Пещера летучих мышей
+    (1, 25),    # 2: Пещера летучих мышей (Босс)
+    (4, 30),    # 3: Подземелье скелетов
+    (1, 40),    # 4: Подземелье скелетов (Босс)
+    (5, 45),    # 5: Логово тролля
+    (1, 55),    # 6: Логово тролля (Босс)
+    (6, 60),    # 7: Лес призраков
+    (1, 70),    # 8: Лес призраков (Босс)
+    (7, 85),    # 9: (заглушка)
+    (1, 100),   # 10: (заглушка, босс)
+    (8, 110),   # 11: (заглушка)
+    (1, 125),   # 12: (заглушка, босс)
+    (9, 140),   # 13: (заглушка)
+    (1, 160),   # 14: (заглушка, босс)
 ]
 
+PLANK_ZONES = [
+    (3, 12),
+    (1, 20),
+    (4, 24),
+    (1, 32),
+    (5, 36),
+    (1, 44),
+    (6, 48),
+    (1, 56),
+    (7, 64),
+    (1, 76),
+    (8, 84),
+    (1, 96),
+    (9, 108),
+    (1, 124),
+]
 
-def get_milestone_total(activity, n):
-    milestones = PUSHUP_MILESTONES if activity == "pushup" else PLANK_MILESTONES
-    keys = sorted(milestones.keys())
-    if n >= keys[-1]:
-        return milestones[keys[-1]]
-    lower = max(k for k in keys if k <= n)
-    upper = min(k for k in keys if k >= n)
-    if lower == upper:
-        return milestones[lower]
-    fraction = (n - lower) / (upper - lower)
-    return milestones[lower] + fraction * (milestones[upper] - milestones[lower])
-
-
-def get_enemy_count(n):
-    if n % 5 == 0 and n > 0:
-        return 1
-    for lo, hi, count in ENEMY_COUNT_SEGMENTS:
-        if lo <= n <= hi:
-            return count
-    return 9
+MAX_DUNGEON = len(PUSHUP_ZONES)  # обе таблицы должны быть одинаковой длины
 
 
 def generate_dungeon(activity, n):
     n = min(max(n, 1), MAX_DUNGEON)
-    total = get_milestone_total(activity, n)
-    is_boss = (n % 5 == 0)
-    enemy_count = 1 if is_boss else get_enemy_count(n)
+    zones = PUSHUP_ZONES if activity == "pushup" else PLANK_ZONES
+    enemy_count, total = zones[n - 1]
+    is_boss = (enemy_count == 1)
 
     hp_each = max(1, round(total / enemy_count))
     enemies = [hp_each] * enemy_count
-    diff = round(total) - sum(enemies)
+    diff = total - sum(enemies)
     enemies[-1] += diff
 
     return {
         "dungeon": n,
         "is_boss": is_boss,
         "enemies": enemies,
-        "xp_reward": round(total)
+        "xp_reward": total
     }
 
 
@@ -200,7 +206,7 @@ async def start_handler(message: Message):
     username = message.from_user.first_name or message.from_user.username or "Игрок"
     await ensure_user_exists(user_id, username)
 
-    personal_url = f"{WEBAPP_URL}?user_id={user_id}&v=8"
+    personal_url = f"{WEBAPP_URL}?user_id={user_id}&v=9"
 
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
@@ -222,8 +228,6 @@ async def start_handler(message: Message):
         reply_markup=keyboard
     )
 
-
-# ===== API =====
 
 async def api_user_status(request):
     user_id = request.query.get("user_id")
