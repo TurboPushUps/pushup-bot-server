@@ -43,7 +43,7 @@ def run_query(sql, params=None, fetchone=False, fetchall=False):
             if fetchall:
                 return cursor.fetchall()
             return None
-        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+        except psycopg2.Error as e:
             print(f"Проблема с соединением (попытка {attempt + 1}): {e}")
             try:
                 connect_db()
