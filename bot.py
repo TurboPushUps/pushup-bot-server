@@ -540,6 +540,8 @@ async def api_dungeon_complete(request):
 
         dungeon_col = "pushup_dungeon" if activity == "pushup" else "plank_dungeon"
 
+        # Сначала узнаём текущий уровень, чтобы понять, повтор это или нет,
+        # и правильно посчитать награду (это нужно знать ДО записи).
         row = await db_query(f"""
             INSERT INTO users (user_id) VALUES (%(user_id)s)
             ON CONFLICT (user_id) DO UPDATE SET user_id = EXCLUDED.user_id
@@ -551,21 +553,22 @@ async def api_dungeon_complete(request):
         is_replay = dungeon_n < current_dungeon
         xp_reward = dungeon_data["xp_reward"] if not is_replay else dungeon_data["xp_reward"] // 2
 
-        points_row = await db_query("""
+        new_dungeon = current_dungeon
+        if not is_replay and current_dungeon < MAX_DUNGEON:
+            new_dungeon = current_dungeon + 1
+
+        # ОДНИМ запросом: начисляем очки И (если нужно) сдвигаем уровень дальше
+        points_row = await db_query(f"""
             UPDATE users
-            SET total_points = total_points + %(xp)s
+            SET total_points = total_points + %(xp)s,
+                {dungeon_col} = %(new_dungeon)s
             WHERE user_id = %(user_id)s
             RETURNING total_points - %(xp)s AS points_before, total_points AS points_after
-        """, {"xp": xp_reward, "user_id": user_id}, fetchone=True)
+        """, {"xp": xp_reward, "new_dungeon": new_dungeon, "user_id": user_id}, fetchone=True)
 
         points_before, points_after = points_row
         level_before = get_level(points_before)
         level_after = get_level(points_after)
-
-        new_dungeon = current_dungeon
-        if not is_replay and current_dungeon < MAX_DUNGEON:
-            new_dungeon = current_dungeon + 1
-            await db_query(f"UPDATE users SET {dungeon_col} = %s WHERE user_id = %s", (new_dungeon, user_id))
 
         return web.json_response({
             "success": True,
