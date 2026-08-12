@@ -211,7 +211,7 @@ async def start_handler(message: Message):
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(
-                text="💪 Открыть Pushup Tracker",
+                text="💪 Открыть Pushup Hero",
                 web_app=WebAppInfo(url=personal_url)
             )]
         ],
