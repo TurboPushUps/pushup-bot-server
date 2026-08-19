@@ -19,6 +19,7 @@ WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
 WEBAPP_URL = "https://turbopushups.github.io/pushup-camera/index.html"
+COMMUNITY_URL = "https://t.me/pushuphero"
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -113,6 +114,10 @@ def init_db():
     run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS squat_purchased_pairs TEXT DEFAULT ''")
     run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS wallsit_purchased_pairs TEXT DEFAULT ''")
 
+    # ===== Прогресс по сюжету (какие сцены уже видел пользователь) =====
+    run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS story_enabled BOOLEAN DEFAULT TRUE")
+    run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS pushup_story_seen TEXT DEFAULT ''")
+
 
 init_db()
 
@@ -174,17 +179,33 @@ def get_next_level_info(points):
     return None, None
 
 
-# ===== ПОДЗЕМЕЛЬЯ: 4 дисциплины =====
+# ===== ПОДЗЕМЕЛЬЯ: 20 уровней (10 глав x 2), 4 дисциплины =====
 # Формат: (количество врагов, суммарный HP на всех врагов зоны)
 
 PUSHUP_ZONES = [
-    (3, 15), (1, 25), (4, 30), (1, 40), (5, 45), (1, 55), (6, 60),
-    (1, 70), (7, 85), (1, 100), (8, 110), (1, 125), (9, 140), (1, 160),
+    (3, 15), (1, 25),
+    (4, 30), (1, 40),
+    (5, 45), (1, 55),
+    (6, 60), (1, 70),
+    (7, 85), (1, 100),
+    (8, 110), (1, 125),
+    (9, 140), (1, 160),
+    (10, 175), (1, 200),
+    (11, 215), (1, 245),
+    (12, 260), (1, 300),
 ]
 
 PLANK_ZONES = [
-    (3, 12), (1, 20), (4, 24), (1, 32), (5, 36), (1, 44), (6, 48),
-    (1, 56), (7, 64), (1, 76), (8, 84), (1, 96), (9, 108), (1, 124),
+    (3, 12), (1, 20),
+    (4, 24), (1, 32),
+    (5, 36), (1, 44),
+    (6, 48), (1, 56),
+    (7, 64), (1, 76),
+    (8, 84), (1, 96),
+    (9, 108), (1, 124),
+    (10, 140), (1, 160),
+    (11, 172), (1, 196),
+    (12, 208), (1, 240),
 ]
 
 # Приседания — HP вдвое больше отжиманий
@@ -200,17 +221,12 @@ ZONE_TABLES = {
     "wallsit": WALLSIT_ZONES,
 }
 
-MAX_DUNGEON = len(PUSHUP_ZONES)
+MAX_DUNGEON = len(PUSHUP_ZONES)  # 20
 
-# Платные пары зон (индекс первой зоны пары, 1-based): Лес призраков и далее
-PAID_PAIR_STARTS = [7, 9, 11, 13]
+# Платные пары зон (номер первой зоны пары, 1-based) — начиная с Леса призраков (глава IV) до конца
+PAID_PAIR_STARTS = [7, 9, 11, 13, 15, 17, 19]
 PAIR_PRICE_STARS = 200
 PREMIUM_PRICE_STARS = 1000
-
-# Пороги достижения "прогрессия по уровням" (только для отжиманий и приседаний)
-def achievement_threshold(level: int) -> int:
-    # level=1 -> 20, level=2 -> 30, level=3 -> 40 ...
-    return 10 + 10 * level
 
 
 def generate_dungeon(activity, n):
@@ -249,6 +265,46 @@ PURCHASED_COL = {
     "squat": "squat_purchased_pairs", "wallsit": "wallsit_purchased_pairs",
 }
 
+# ===== СЮЖЕТ: названия подземелий и группировка по главам =====
+
+ZONES_META = [
+    {"n": 1, "name": "Пещера летучих мышей", "chapter": 1},
+    {"n": 2, "name": "Гнездо ночного хищника", "chapter": 1},
+    {"n": 3, "name": "Подземелье скелетов", "chapter": 2},
+    {"n": 4, "name": "Зал костяного командира", "chapter": 2},
+    {"n": 5, "name": "Логово тролля", "chapter": 3},
+    {"n": 6, "name": "Двухголовый командир троллей", "chapter": 3},
+    {"n": 7, "name": "Лес призраков", "chapter": 4},
+    {"n": 8, "name": "Рой погибших душ", "chapter": 4},
+    {"n": 9, "name": "Топи гниения", "chapter": 5},
+    {"n": 10, "name": "Трон затонувшего короля", "chapter": 5},
+    {"n": 11, "name": "Павшие рыцари", "chapter": 6},
+    {"n": 12, "name": "Чёрный рыцарь", "chapter": 6},
+    {"n": 13, "name": "Огненные твари", "chapter": 7},
+    {"n": 14, "name": "Повелитель пламени", "chapter": 7},
+    {"n": 15, "name": "Искажённые", "chapter": 8},
+    {"n": 16, "name": "Страж Бездны", "chapter": 8},
+    {"n": 17, "name": "Зал испытаний", "chapter": 9},
+    {"n": 18, "name": "Варен", "chapter": 9},
+    {"n": 19, "name": "Последняя печать", "chapter": 10},
+    {"n": 20, "name": "Морвен", "chapter": 10},
+]
+
+CHAPTERS = [
+    {"chapter": 1, "title": "Крылья во тьме", "start": 1, "end": 2},
+    {"chapter": 2, "title": "Кости не забывают", "start": 3, "end": 4},
+    {"chapter": 3, "title": "Голод гор", "start": 5, "end": 6},
+    {"chapter": 4, "title": "Лес, который помнит", "start": 7, "end": 8},
+    {"chapter": 5, "title": "Гнилое сердце", "start": 9, "end": 10},
+    {"chapter": 6, "title": "Крепость павших", "start": 11, "end": 12},
+    {"chapter": 7, "title": "Земли пепла", "start": 13, "end": 14},
+    {"chapter": 8, "title": "Бездна", "start": 15, "end": 16},
+    {"chapter": 9, "title": "Цитадель", "start": 17, "end": 18},
+    {"chapter": 10, "title": "Трон", "start": 19, "end": 20},
+]
+
+ACTIVITY_NAMES = {"pushup": "Отжимания", "plank": "Планка", "squat": "Приседания", "wallsit": "Стульчик"}
+
 
 @dp.message(CommandStart())
 async def start_handler(message: Message):
@@ -256,7 +312,7 @@ async def start_handler(message: Message):
     username = message.from_user.first_name or message.from_user.username or "Игрок"
     await ensure_user_exists(user_id, username)
 
-    personal_url = f"{WEBAPP_URL}?user_id={user_id}&v=10"
+    personal_url = f"{WEBAPP_URL}?user_id={user_id}&v=11"
 
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
@@ -269,12 +325,14 @@ async def start_handler(message: Message):
     )
 
     await message.answer(
-        "💪 Добро пожаловать!\n\n"
+        "💪 Добро пожаловать в PushUp Hero!\n\n"
         "Здесь твои тренировки превращаются в награды.\n\n"
         "📹 Проходи режим приключений или тренируйся свободно перед камерой — бот автоматически всё засчитает.\n"
         "🏆 Получай внутриигровую валюту и ценные награды.\n"
         "📈 Прокачивай своего персонажа, открывай новые уровни и достижения.\n"
-        "🥇 Соревнуйся с другими игроками и поднимайся в таблице лидеров.",
+        "🥇 Соревнуйся с другими игроками и поднимайся в таблице лидеров.\n\n"
+        f"💬 Все новости и обновления — в нашей группе: {COMMUNITY_URL}\n"
+        "Там же можно оставить пожелания и идеи для приложения.",
         reply_markup=keyboard
     )
 
@@ -346,7 +404,7 @@ async def api_profile(request):
                       total_squats, daily_squats, last_squat_date, squat_streak, squat_best_streak, squat_dungeon,
                       total_wallsit_seconds, daily_wallsit_seconds, last_wallsit_date, wallsit_streak, wallsit_best_streak, wallsit_dungeon,
                       pushup_achv_level, squat_achv_level,
-                      stamina_remaining, stamina_reset_date, premium_until,
+                      stamina_remaining, stamina_reset_date, premium_until, story_enabled,
                       CURRENT_DATE
         """, {"user_id": user_id}, fetchone=True)
 
@@ -356,7 +414,7 @@ async def api_profile(request):
          total_squats, daily_squats, last_squat_date, squat_streak, squat_best_streak, squat_dungeon,
          total_wallsit_seconds, daily_wallsit_seconds, last_wallsit_date, wallsit_streak, wallsit_best_streak, wallsit_dungeon,
          pushup_achv_level, squat_achv_level,
-         stamina_remaining, stamina_reset_date, premium_until,
+         stamina_remaining, stamina_reset_date, premium_until, story_enabled,
          today) = row
 
         def today_or_zero(value, last_date):
@@ -377,8 +435,8 @@ async def api_profile(request):
         stamina_max = 8 if premium_active else 4
         stamina_display = stamina_remaining if stamina_reset_date == today else stamina_max
 
-        pushup_next = achievement_threshold((pushup_achv_level or 0) + 1)
-        squat_next = achievement_threshold((squat_achv_level or 0) + 1)
+        pushup_next = 10 + 10 * ((pushup_achv_level or 0) + 1)
+        squat_next = 10 + 10 * ((squat_achv_level or 0) + 1)
 
         return web.json_response({
             "level": level_title,
@@ -412,10 +470,32 @@ async def api_profile(request):
             "stamina": {"remaining": stamina_display, "max": stamina_max},
             "premium_active": premium_active,
             "premium_until": premium_until.isoformat() if premium_until else None,
+            "story_enabled": story_enabled if story_enabled is not None else True,
         })
     except Exception as e:
         print(f"Ошибка в api_profile: {e}")
         return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
+
+
+async def api_set_story_enabled(request):
+    try:
+        data = await request.json()
+        user_id = data.get("user_id")
+        enabled = data.get("enabled")
+        if user_id is None or enabled is None:
+            return web.json_response({"error": "Некорректные данные"}, status=400)
+        await db_query(
+            "UPDATE users SET story_enabled = %s WHERE user_id = %s",
+            (bool(enabled), int(user_id))
+        )
+        return web.json_response({"success": True})
+    except Exception as e:
+        print(f"Ошибка в api_set_story_enabled: {e}")
+        return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
+
+
+async def api_story_meta(request):
+    return web.json_response({"chapters": CHAPTERS, "zones": ZONES_META})
 
 
 async def api_leaderboard(request):
@@ -456,16 +536,6 @@ async def api_leaderboard(request):
         return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
 
 
-def bump_achievement_level_sql(col_name, daily_col):
-    """SQL-фрагмент: поднимает уровень достижения, если сегодняшний счётчик перевалил следующий порог."""
-    return f"""
-        {col_name} = CASE
-            WHEN {daily_col} >= (10 + 10 * ({col_name} + 1)) THEN {col_name} + 1
-            ELSE {col_name}
-        END
-    """
-
-
 async def api_save_pushups(request):
     try:
         data = await request.json()
@@ -479,7 +549,7 @@ async def api_save_pushups(request):
         count = int(count)
         points_earned = count * 10
 
-        row = await db_query(f"""
+        row = await db_query("""
             INSERT INTO users (user_id, total_points, total_pushups, daily_pushups, last_pushup_date, pushup_streak, pushup_best_streak, pushup_achv_level)
             VALUES (%(user_id)s, %(points)s, %(count)s, %(count)s, CURRENT_DATE, 1, 1,
                     CASE WHEN %(count)s >= 20 THEN 1 ELSE 0 END)
@@ -540,7 +610,7 @@ async def api_save_squats(request):
         count = int(count)
         points_earned = count * 10
 
-        row = await db_query(f"""
+        row = await db_query("""
             INSERT INTO users (user_id, total_points, total_squats, daily_squats, last_squat_date, squat_streak, squat_best_streak, squat_achv_level)
             VALUES (%(user_id)s, %(points)s, %(count)s, %(count)s, CURRENT_DATE, 1, 1,
                     CASE WHEN %(count)s >= 20 THEN 1 ELSE 0 END)
@@ -784,18 +854,27 @@ async def api_dungeon_info(request):
     dungeon_data = generate_dungeon(activity, dungeon_n)
     is_replay = dungeon_n < current_dungeon
 
+    pair_start = pair_start_for_zone(dungeon_n)
+    requires_payment = (
+        pair_start is not None
+        and not premium_active
+        and pair_start not in purchased_pairs
+    )
+
     return web.json_response({
         "current_dungeon": current_dungeon,
         "max_dungeon": MAX_DUNGEON,
         "requested_dungeon": dungeon_n,
         "is_replay": is_replay,
         "is_boss": dungeon_data["is_boss"],
-        "enemies": dungeon_data["enemies"],
+        "enemies": dungeon_data["enemies"] if not requires_payment else [],
         "xp_reward": dungeon_data["xp_reward"] if not is_replay else dungeon_data["xp_reward"] // 2,
         "purchased_pairs": purchased_pairs,
         "premium_active": premium_active,
         "paid_pair_starts": PAID_PAIR_STARTS,
         "pair_price_stars": PAIR_PRICE_STARS,
+        "requires_payment": requires_payment,
+        "pair_start": pair_start,
     })
 
 
@@ -868,7 +947,6 @@ async def api_create_zone_invoice(request):
         purchased_raw = row[0] if row else ""
         purchased_pairs = [int(x) for x in (purchased_raw or "").split(",") if x.strip().isdigit()]
 
-        # Проверка порядка: нельзя купить пару, если предыдущая платная пара ещё не куплена
         idx = PAID_PAIR_STARTS.index(pair_start)
         for earlier in PAID_PAIR_STARTS[:idx]:
             if earlier not in purchased_pairs:
@@ -883,7 +961,7 @@ async def api_create_zone_invoice(request):
 
         invoice_url = await bot.create_invoice_link(
             title=title,
-            description=f"Открывает {zone['name']} и следующий уровень (босс) для дисциплины «{ACTIVITY_NAMES[activity]}»",
+            description=f"Открывает «{zone['name']}» и следующий уровень (босс) для дисциплины «{ACTIVITY_NAMES[activity]}»",
             payload=payload,
             provider_token="",
             currency="XTR",
@@ -904,7 +982,7 @@ async def api_create_premium_invoice(request):
 
         invoice_url = await bot.create_invoice_link(
             title="Премиум на 30 дней",
-            description="8 подходов в день вместо 4 и доступ ко всем платным подземельям на 30 дней.",
+            description="8 подходов в день вместо 4 и открытый доступ ко всем платным подземельям на 30 дней.",
             payload="premium",
             provider_token="",
             currency="XTR",
@@ -975,7 +1053,8 @@ async def api_reset_progress(request):
                 pushup_best_streak = 0, plank_best_streak = 0, squat_best_streak = 0, wallsit_best_streak = 0,
                 pushup_dungeon = 1, plank_dungeon = 1, squat_dungeon = 1, wallsit_dungeon = 1,
                 pushup_achv_level = 0, squat_achv_level = 0,
-                pushup_purchased_pairs = '', plank_purchased_pairs = '', squat_purchased_pairs = '', wallsit_purchased_pairs = ''
+                pushup_purchased_pairs = '', plank_purchased_pairs = '', squat_purchased_pairs = '', wallsit_purchased_pairs = '',
+                pushup_story_seen = ''
             WHERE user_id = %s
         """, (user_id,))
 
@@ -983,18 +1062,6 @@ async def api_reset_progress(request):
     except Exception as e:
         print(f"Ошибка в api_reset_progress: {e}")
         return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
-
-
-ZONES_META = [
-    {"n": 1, "name": "Пещера летучих мышей"}, {"n": 2, "name": "Пещера летучих мышей (Босс)"},
-    {"n": 3, "name": "Подземелье скелетов"}, {"n": 4, "name": "Подземелье скелетов (Босс)"},
-    {"n": 5, "name": "Логово тролля"}, {"n": 6, "name": "Логово тролля (Босс)"},
-    {"n": 7, "name": "Лес призраков"}, {"n": 8, "name": "Лес призраков (Босс)"},
-    {"n": 9, "name": "Забытые руины"}, {"n": 10, "name": "Забытые руины (Босс)"},
-    {"n": 11, "name": "Ледяная бездна"}, {"n": 12, "name": "Ледяная бездна (Босс)"},
-    {"n": 13, "name": "Огненные врата"}, {"n": 14, "name": "Огненные врата (Босс)"},
-]
-ACTIVITY_NAMES = {"pushup": "Отжимания", "plank": "Планка", "squat": "Приседания", "wallsit": "Стульчик"}
 
 
 @web.middleware
@@ -1020,6 +1087,8 @@ def main():
     app.router.add_get("/api/user_status", api_user_status)
     app.router.add_post("/api/register_nickname", api_register_nickname)
     app.router.add_get("/api/profile", api_profile)
+    app.router.add_post("/api/set_story_enabled", api_set_story_enabled)
+    app.router.add_get("/api/story_meta", api_story_meta)
     app.router.add_get("/api/leaderboard", api_leaderboard)
     app.router.add_post("/api/save_pushups", api_save_pushups)
     app.router.add_post("/api/save_plank", api_save_plank)
