@@ -30,7 +30,17 @@ db = None
 def connect_db():
     global db
     print("Подключаемся к базе данных...")
-    db = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+    dsn = DATABASE_URL
+    if "sslmode" not in dsn:
+        dsn += ("&" if "?" in dsn else "?") + "sslmode=require"
+    db = psycopg2.connect(
+        dsn,
+        connect_timeout=10,
+        keepalives=1,
+        keepalives_idle=30,
+        keepalives_interval=10,
+        keepalives_count=5,
+    )
     db.autocommit = True
 
 
@@ -117,6 +127,9 @@ def init_db():
     run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS spendable_points INTEGER DEFAULT 0")
     run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS potion_purchases_in_week INTEGER DEFAULT 0")
     run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS potion_week_anchor_date DATE")
+    # ===== Идемпотентность списания стамины (защита от двойного списания при обрыве связи) =====
+    run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_stamina_token TEXT")
+    run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_stamina_token_at TIMESTAMPTZ")
 
 
 init_db()
@@ -273,7 +286,7 @@ async def start_handler(message: Message):
 
     await message.answer(
         "⚔️ PushUp Hero\n\n"
-        "Врата снова открыты. Тренировки превращаются в награды, а каждая победа — часть большой истории.\n\n"
+        "Спорт ещё никогда не был таким затягивающим. Каждое отжимание — удар по врагу, каждая тренировка — шаг в истории, где ты главный герой.\n\n"
         "📹 Проходи сюжетную кампанию или тренируйся свободно перед камерой — бот всё засчитает сам.\n"
         "🏆 Получай награды, качай персонажа, соревнуйся в таблице лидеров.\n\n"
         f"💬 Новости и пожелания — в группе: {COMMUNITY_URL}",
@@ -650,9 +663,23 @@ async def api_consume_stamina(request):
     try:
         data = await request.json()
         user_id = data.get("user_id")
+        token = data.get("token")
         if not user_id:
             return web.json_response({"error": "user_id обязателен"}, status=400)
         user_id = int(user_id)
+
+        # Если этот же токен операции уже обрабатывался недавно — не списываем повторно,
+        # а просто возвращаем актуальное состояние (защита от повторов при обрыве связи)
+        if token:
+            existing = await db_query("""
+                SELECT stamina_remaining, (CASE WHEN premium_until >= CURRENT_DATE THEN 8 ELSE 4 END),
+                       last_stamina_token, last_stamina_token_at
+                FROM users WHERE user_id = %s
+            """, (user_id,), fetchone=True)
+            if existing:
+                remaining, max_stamina, last_token, last_token_at = existing
+                if last_token == token and last_token_at is not None:
+                    return web.json_response({"success": True, "remaining": remaining, "max": max_stamina, "replayed": True})
 
         row = await db_query("""
             UPDATE users SET
@@ -661,11 +688,13 @@ async def api_consume_stamina(request):
                         THEN (CASE WHEN premium_until >= CURRENT_DATE THEN 8 ELSE 4 END) - 1
                     ELSE stamina_remaining - 1
                 END,
-                stamina_reset_date = CURRENT_DATE
+                stamina_reset_date = CURRENT_DATE,
+                last_stamina_token = %(token)s,
+                last_stamina_token_at = NOW()
             WHERE user_id = %(user_id)s
               AND (stamina_reset_date IS DISTINCT FROM CURRENT_DATE OR stamina_remaining > 0)
             RETURNING stamina_remaining, (CASE WHEN premium_until >= CURRENT_DATE THEN 8 ELSE 4 END) AS max_stamina
-        """, {"user_id": user_id}, fetchone=True)
+        """, {"user_id": user_id, "token": token}, fetchone=True)
 
         if row is None:
             fallback = await db_query("""
