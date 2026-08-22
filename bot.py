@@ -763,7 +763,8 @@ async def api_dungeon_info(request):
 
     requested = request.query.get("dungeon")
     dungeon_n = int(requested) if requested and requested.isdigit() else current_dungeon
-    dungeon_n = min(max(dungeon_n, 1), current_dungeon)
+    # Разрешаем заглянуть на 1 уровень вперёд (для фоновой предзагрузки) — пройти его раньше времени всё равно нельзя
+    dungeon_n = min(max(dungeon_n, 1), min(current_dungeon + 1, MAX_DUNGEON))
 
     dungeon_data = generate_dungeon(activity, dungeon_n)
     is_replay = dungeon_n < current_dungeon
