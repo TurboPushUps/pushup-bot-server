@@ -213,7 +213,8 @@ ZONE_TABLES = {"pushup": PUSHUP_ZONES, "plank": PLANK_ZONES, "squat": SQUAT_ZONE
 MAX_DUNGEON = len(PUSHUP_ZONES)
 
 PAID_PAIR_STARTS = [7, 9, 11, 13, 15, 17, 19]
-PAIR_PRICE_STARS = 200
+PAIR_PRICE_STARS = 200 from datetime import date
+FREE_STORY_UNTIL = date(2026, 9, 10)  # сюжет полностью бесплатен для всех включительно по эту дату
 PREMIUM_PRICE_STARS = 1000
 
 # ===== Экономика зелий выносливости =====
@@ -289,6 +290,7 @@ async def start_handler(message: Message):
         "Спорт ещё никогда не был таким затягивающим. Каждое отжимание — удар по врагу, каждая тренировка — шаг в истории, где ты главный герой.\n\n"
         "📹 Проходи сюжетную кампанию или тренируйся свободно перед камерой — бот всё засчитает сам.\n"
         "🏆 Получай награды, качай персонажа, соревнуйся в таблице лидеров.\n\n"
+        "🎉 Сюжет полностью открыт и бесплатен для всех до 10 сентября включительно. После этой даты платными станут главы, начиная с IV — «Лес, который помнит» (200 ⭐ за пару подземелий).\n\n"
         f"💬 Новости и пожелания — в группе: {COMMUNITY_URL}",
         reply_markup=keyboard
     )
@@ -798,7 +800,11 @@ async def api_dungeon_info(request):
     dungeon_data = generate_dungeon(activity, dungeon_n)
     is_replay = dungeon_n < current_dungeon
     pair_start = pair_start_for_zone(dungeon_n)
-    requires_payment = pair_start is not None and not premium_active and pair_start not in purchased_pairs
+    story_still_free = today <= FREE_STORY_UNTIL
+    requires_payment = (
+        pair_start is not None and not premium_active and pair_start not in purchased_pairs
+        and not story_still_free
+    )
 
     return web.json_response({
         "current_dungeon": current_dungeon, "max_dungeon": MAX_DUNGEON, "requested_dungeon": dungeon_n,
@@ -871,6 +877,9 @@ async def api_create_zone_invoice(request):
         if not user_id or activity not in PURCHASED_COL or pair_start not in PAID_PAIR_STARTS:
             return web.json_response({"error": "Некорректные данные"}, status=400)
         user_id = int(user_id)
+        from datetime import date as _date
+        if _date.today() <= FREE_STORY_UNTIL:
+            return web.json_response({"error": "Сейчас всё бесплатно — платный доступ откроется после 10 сентября"}, status=400)
         purchased_col = PURCHASED_COL[activity]
 
         row = await db_query(f"SELECT {purchased_col} FROM users WHERE user_id = %s", (user_id,), fetchone=True)
