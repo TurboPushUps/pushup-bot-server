@@ -908,7 +908,24 @@ async def api_create_zone_invoice(request):
         print(f"Ошибка в api_create_zone_invoice: {e}")
         return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
 
-
+async def api_create_support_invoice(request):
+    try:
+        data = await request.json()
+        user_id = data.get("user_id")
+        amount = data.get("amount", 150)
+        if not user_id:
+            return web.json_response({"error": "user_id обязателен"}, status=400)
+        amount = max(1, int(amount))
+        invoice_url = await bot.create_invoice_link(
+            title="Поддержать PushUp Hero",
+            description="Спасибо, что помогаешь проекту развиваться! Это разовый добровольный донат, ни на что игровое не влияет.",
+            payload="support", provider_token="", currency="XTR",
+            prices=[LabeledPrice(label="Поддержка проекта", amount=amount)],
+        )
+        return web.json_response({"url": invoice_url})
+    except Exception as e:
+        print(f"Ошибка в api_create_support_invoice: {e}")
+        return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
 async def api_create_premium_invoice(request):
     try:
         data = await request.json()
@@ -943,6 +960,8 @@ async def process_successful_payment(message: Message):
                 WHERE user_id = %s
             """, (user_id,))
             await message.answer("✅ Премиум активирован на 30 дней! Спасибо за поддержку 🙏")
+            elif payload == "support":
+            await message.answer("🤍 Спасибо за поддержку! Это очень много значит для развития проекта.")
         elif payload.startswith("zone:"):
             _, activity, pair_start = payload.split(":")
             purchased_col = PURCHASED_COL.get(activity)
@@ -1030,6 +1049,8 @@ def main():
     app.router.add_post("/api/buy_potion", api_buy_potion)
     app.router.add_post("/api/create_zone_invoice", api_create_zone_invoice)
     app.router.add_post("/api/create_premium_invoice", api_create_premium_invoice)
+    app.router.add_post("/api/create_support_invoice", api_create_support_invoice)
+    
 
     dp.startup.register(on_startup)
     webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
