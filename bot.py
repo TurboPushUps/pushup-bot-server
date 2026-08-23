@@ -2,6 +2,7 @@ import os
 import re
 import asyncio
 import psycopg2
+from datetime import date
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
@@ -123,10 +124,10 @@ def init_db():
     run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS story_enabled BOOLEAN DEFAULT TRUE")
     run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS pushup_story_seen TEXT DEFAULT ''")
 
-    # ===== Эссенция (тратимые очки) и зелья выносливости =====
     run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS spendable_points INTEGER DEFAULT 0")
     run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS potion_purchases_in_week INTEGER DEFAULT 0")
     run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS potion_week_anchor_date DATE")
+
     # ===== Идемпотентность списания стамины (защита от двойного списания при обрыве связи) =====
     run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_stamina_token TEXT")
     run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_stamina_token_at TIMESTAMPTZ")
@@ -213,13 +214,15 @@ ZONE_TABLES = {"pushup": PUSHUP_ZONES, "plank": PLANK_ZONES, "squat": SQUAT_ZONE
 MAX_DUNGEON = len(PUSHUP_ZONES)
 
 PAID_PAIR_STARTS = [7, 9, 11, 13, 15, 17, 19]
-PAIR_PRICE_STARS = 200 from datetime import date
-FREE_STORY_UNTIL = date(2026, 9, 10)  # сюжет полностью бесплатен для всех включительно по эту дату
+PAIR_PRICE_STARS = 200
 PREMIUM_PRICE_STARS = 1000
 
 # ===== Экономика зелий выносливости =====
 POTION_PRICE_ESSENCE = 300
 MAX_POTIONS_PER_WEEK = 2
+
+# ===== Сюжет полностью бесплатен для всех до этой даты включительно =====
+FREE_STORY_UNTIL = date(2026, 9, 10)
 
 
 def generate_dungeon(activity, n):
@@ -279,7 +282,7 @@ async def start_handler(message: Message):
     username = message.from_user.first_name or message.from_user.username or "Игрок"
     await ensure_user_exists(user_id, username)
 
-    personal_url = f"{WEBAPP_URL}?user_id={user_id}&v=12"
+    personal_url = f"{WEBAPP_URL}?user_id={user_id}&v=13"
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚀 Начать приключение", web_app=WebAppInfo(url=personal_url))]
@@ -410,6 +413,7 @@ async def api_profile(request):
                 "potions_left_this_week": potions_left_this_week,
                 "max_potions_per_week": MAX_POTIONS_PER_WEEK,
             },
+            "story_free_until": FREE_STORY_UNTIL.isoformat(),
         })
     except Exception as e:
         print(f"Ошибка в api_profile: {e}")
@@ -713,7 +717,7 @@ async def api_consume_stamina(request):
         return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
 
 
-# ===== ЗЕЛЬЯ ВЫНОСЛИВОСТИ (за эссенцию, с недельным лимитом) =====
+# ===== ЗЕЛЬЯ ВЫНОСЛИВОСТИ =====
 
 async def api_buy_potion(request):
     try:
@@ -800,6 +804,7 @@ async def api_dungeon_info(request):
     dungeon_data = generate_dungeon(activity, dungeon_n)
     is_replay = dungeon_n < current_dungeon
     pair_start = pair_start_for_zone(dungeon_n)
+
     story_still_free = today <= FREE_STORY_UNTIL
     requires_payment = (
         pair_start is not None and not premium_active and pair_start not in purchased_pairs
@@ -814,6 +819,7 @@ async def api_dungeon_info(request):
         "purchased_pairs": purchased_pairs, "premium_active": premium_active,
         "paid_pair_starts": PAID_PAIR_STARTS, "pair_price_stars": PAIR_PRICE_STARS,
         "requires_payment": requires_payment, "pair_start": pair_start,
+        "story_free_until": FREE_STORY_UNTIL.isoformat(),
     })
 
 
@@ -877,9 +883,10 @@ async def api_create_zone_invoice(request):
         if not user_id or activity not in PURCHASED_COL or pair_start not in PAID_PAIR_STARTS:
             return web.json_response({"error": "Некорректные данные"}, status=400)
         user_id = int(user_id)
-        from datetime import date as _date
-        if _date.today() <= FREE_STORY_UNTIL:
+
+        if date.today() <= FREE_STORY_UNTIL:
             return web.json_response({"error": "Сейчас всё бесплатно — платный доступ откроется после 10 сентября"}, status=400)
+
         purchased_col = PURCHASED_COL[activity]
 
         row = await db_query(f"SELECT {purchased_col} FROM users WHERE user_id = %s", (user_id,), fetchone=True)
@@ -908,6 +915,25 @@ async def api_create_zone_invoice(request):
         print(f"Ошибка в api_create_zone_invoice: {e}")
         return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
 
+
+async def api_create_premium_invoice(request):
+    try:
+        data = await request.json()
+        user_id = data.get("user_id")
+        if not user_id:
+            return web.json_response({"error": "user_id обязателен"}, status=400)
+        invoice_url = await bot.create_invoice_link(
+            title="Премиум на 30 дней",
+            description="8 подходов в день вместо 4 и открытый доступ ко всем платным подземельям на 30 дней.",
+            payload="premium", provider_token="", currency="XTR",
+            prices=[LabeledPrice(label="Премиум 30 дней", amount=PREMIUM_PRICE_STARS)],
+        )
+        return web.json_response({"url": invoice_url})
+    except Exception as e:
+        print(f"Ошибка в api_create_premium_invoice: {e}")
+        return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
+
+
 async def api_create_support_invoice(request):
     try:
         data = await request.json()
@@ -925,22 +951,6 @@ async def api_create_support_invoice(request):
         return web.json_response({"url": invoice_url})
     except Exception as e:
         print(f"Ошибка в api_create_support_invoice: {e}")
-        return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
-async def api_create_premium_invoice(request):
-    try:
-        data = await request.json()
-        user_id = data.get("user_id")
-        if not user_id:
-            return web.json_response({"error": "user_id обязателен"}, status=400)
-        invoice_url = await bot.create_invoice_link(
-            title="Премиум на 30 дней",
-            description="8 подходов в день вместо 4 и открытый доступ ко всем платным подземельям на 30 дней.",
-            payload="premium", provider_token="", currency="XTR",
-            prices=[LabeledPrice(label="Премиум 30 дней", amount=PREMIUM_PRICE_STARS)],
-        )
-        return web.json_response({"url": invoice_url})
-    except Exception as e:
-        print(f"Ошибка в api_create_premium_invoice: {e}")
         return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
 
 
@@ -960,7 +970,7 @@ async def process_successful_payment(message: Message):
                 WHERE user_id = %s
             """, (user_id,))
             await message.answer("✅ Премиум активирован на 30 дней! Спасибо за поддержку 🙏")
-            elif payload == "support":
+        elif payload == "support":
             await message.answer("🤍 Спасибо за поддержку! Это очень много значит для развития проекта.")
         elif payload.startswith("zone:"):
             _, activity, pair_start = payload.split(":")
@@ -1050,7 +1060,6 @@ def main():
     app.router.add_post("/api/create_zone_invoice", api_create_zone_invoice)
     app.router.add_post("/api/create_premium_invoice", api_create_premium_invoice)
     app.router.add_post("/api/create_support_invoice", api_create_support_invoice)
-    
 
     dp.startup.register(on_startup)
     webhook_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
