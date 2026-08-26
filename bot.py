@@ -1,8 +1,13 @@
 import os
 import re
+import hmac
+import time
+import json
+import hashlib
 import asyncio
 import psycopg2
 from datetime import date
+from urllib.parse import parse_qsl
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
@@ -128,12 +133,72 @@ def init_db():
     run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS potion_purchases_in_week INTEGER DEFAULT 0")
     run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS potion_week_anchor_date DATE")
 
-    # ===== Идемпотентность списания стамины (защита от двойного списания при обрыве связи) =====
     run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_stamina_token TEXT")
     run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_stamina_token_at TIMESTAMPTZ")
 
 
 init_db()
+
+
+# ===== ПРОВЕРКА ПОДПИСИ TELEGRAM (initData) =====
+# Это единственный источник правды о том, кто делает запрос — клиент больше
+# не может «представиться» чужим user_id, подпись проверяется токеном бота.
+
+def verify_init_data(init_data: str, max_age_seconds: int = 86400):
+    if not init_data:
+        return None
+    try:
+        parsed = dict(parse_qsl(init_data, strict_parsing=True))
+    except Exception:
+        return None
+
+    received_hash = parsed.pop("hash", None)
+    if not received_hash:
+        return None
+
+    data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
+    secret_key = hmac.new(b"WebAppData", TOKEN.encode(), hashlib.sha256).digest()
+    computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+
+    if not hmac.compare_digest(computed_hash, received_hash):
+        return None
+
+    auth_date = parsed.get("auth_date")
+    if auth_date:
+        try:
+            if time.time() - int(auth_date) > max_age_seconds:
+                return None
+        except ValueError:
+            return None
+
+    user_json = parsed.get("user")
+    if not user_json:
+        return None
+    try:
+        user = json.loads(user_json)
+    except Exception:
+        return None
+
+    return user
+
+
+async def resolve_user_id(request, body=None):
+    """Достаёт и проверяет initData из тела POST-запроса или из query-параметра GET.
+    Возвращает подтверждённый Telegram user_id или None, если подпись невалидна."""
+    init_data = None
+    if body is not None:
+        init_data = body.get("init_data")
+    if not init_data:
+        init_data = request.query.get("init_data")
+
+    user = verify_init_data(init_data)
+    if not user:
+        return None
+    return user.get("id")
+
+
+def unauthorized():
+    return web.json_response({"error": "Не удалось подтвердить пользователя Telegram"}, status=401)
 
 
 async def ensure_user_exists(user_id, username=None):
@@ -217,11 +282,9 @@ PAID_PAIR_STARTS = [7, 9, 11, 13, 15, 17, 19]
 PAIR_PRICE_STARS = 200
 PREMIUM_PRICE_STARS = 1000
 
-# ===== Экономика зелий выносливости =====
 POTION_PRICE_ESSENCE = 300
 MAX_POTIONS_PER_WEEK = 2
 
-# ===== Сюжет полностью бесплатен для всех до этой даты включительно =====
 FREE_STORY_UNTIL = date(2026, 9, 10)
 
 
@@ -282,7 +345,7 @@ async def start_handler(message: Message):
     username = message.from_user.first_name or message.from_user.username or "Игрок"
     await ensure_user_exists(user_id, username)
 
-    personal_url = f"{WEBAPP_URL}?user_id={user_id}&v=13"
+    personal_url = f"{WEBAPP_URL}?v=14"
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚀 Начать приключение", web_app=WebAppInfo(url=personal_url))]
@@ -302,10 +365,10 @@ async def start_handler(message: Message):
 # ===== API: базовые =====
 
 async def api_user_status(request):
-    user_id = request.query.get("user_id")
-    if not user_id or not user_id.isdigit():
-        return web.json_response({"error": "user_id обязателен"}, status=400)
-    user_id = int(user_id)
+    user_id = await resolve_user_id(request)
+    if not user_id:
+        return unauthorized()
+
     row = await db_query("""
         INSERT INTO users (user_id) VALUES (%s)
         ON CONFLICT (user_id) DO UPDATE SET user_id = EXCLUDED.user_id
@@ -318,11 +381,10 @@ async def api_user_status(request):
 async def api_register_nickname(request):
     try:
         data = await request.json()
-        user_id = data.get("user_id")
-        nickname = data.get("nickname", "")
+        user_id = await resolve_user_id(request, data)
         if not user_id:
-            return web.json_response({"error": "user_id обязателен"}, status=400)
-        user_id = int(user_id)
+            return unauthorized()
+        nickname = data.get("nickname", "")
         valid, error = is_nickname_valid(nickname)
         if not valid:
             return web.json_response({"success": False, "error": error})
@@ -338,10 +400,9 @@ async def api_register_nickname(request):
 
 
 async def api_profile(request):
-    user_id = request.query.get("user_id")
-    if not user_id or not user_id.isdigit():
-        return web.json_response({"error": "user_id обязателен"}, status=400)
-    user_id = int(user_id)
+    user_id = await resolve_user_id(request)
+    if not user_id:
+        return unauthorized()
 
     try:
         row = await db_query("""
@@ -423,11 +484,13 @@ async def api_profile(request):
 async def api_set_story_enabled(request):
     try:
         data = await request.json()
-        user_id = data.get("user_id")
+        user_id = await resolve_user_id(request, data)
+        if not user_id:
+            return unauthorized()
         enabled = data.get("enabled")
-        if user_id is None or enabled is None:
+        if enabled is None:
             return web.json_response({"error": "Некорректные данные"}, status=400)
-        await db_query("UPDATE users SET story_enabled = %s WHERE user_id = %s", (bool(enabled), int(user_id)))
+        await db_query("UPDATE users SET story_enabled = %s WHERE user_id = %s", (bool(enabled), user_id))
         return web.json_response({"success": True})
     except Exception as e:
         print(f"Ошибка в api_set_story_enabled: {e}")
@@ -475,11 +538,12 @@ async def api_leaderboard(request):
 async def api_save_pushups(request):
     try:
         data = await request.json()
-        user_id = data.get("user_id")
+        user_id = await resolve_user_id(request, data)
+        if not user_id:
+            return unauthorized()
         count = data.get("count")
-        if not user_id or not count or count <= 0:
+        if not count or count <= 0:
             return web.json_response({"error": "Некорректные данные"}, status=400)
-        user_id = int(user_id)
         count = int(count)
         points_earned = count * 10
 
@@ -521,11 +585,12 @@ async def api_save_pushups(request):
 async def api_save_squats(request):
     try:
         data = await request.json()
-        user_id = data.get("user_id")
+        user_id = await resolve_user_id(request, data)
+        if not user_id:
+            return unauthorized()
         count = data.get("count")
-        if not user_id or not count or count <= 0:
+        if not count or count <= 0:
             return web.json_response({"error": "Некорректные данные"}, status=400)
-        user_id = int(user_id)
         count = int(count)
         points_earned = count * 10
 
@@ -567,11 +632,12 @@ async def api_save_squats(request):
 async def api_save_plank(request):
     try:
         data = await request.json()
-        user_id = data.get("user_id")
+        user_id = await resolve_user_id(request, data)
+        if not user_id:
+            return unauthorized()
         seconds = data.get("seconds")
-        if not user_id or not seconds or seconds <= 0:
+        if not seconds or seconds <= 0:
             return web.json_response({"error": "Некорректные данные"}, status=400)
-        user_id = int(user_id)
         seconds = int(seconds)
         points_earned = seconds * 2
 
@@ -608,11 +674,12 @@ async def api_save_plank(request):
 async def api_save_wallsit(request):
     try:
         data = await request.json()
-        user_id = data.get("user_id")
+        user_id = await resolve_user_id(request, data)
+        if not user_id:
+            return unauthorized()
         seconds = data.get("seconds")
-        if not user_id or not seconds or seconds <= 0:
+        if not seconds or seconds <= 0:
             return web.json_response({"error": "Некорректные данные"}, status=400)
-        user_id = int(user_id)
         seconds = int(seconds)
         points_earned = seconds * 2
 
@@ -649,10 +716,9 @@ async def api_save_wallsit(request):
 # ===== СТАМИНА =====
 
 async def api_get_stamina(request):
-    user_id = request.query.get("user_id")
-    if not user_id or not user_id.isdigit():
-        return web.json_response({"error": "user_id обязателен"}, status=400)
-    user_id = int(user_id)
+    user_id = await resolve_user_id(request)
+    if not user_id:
+        return unauthorized()
     row = await db_query("""
         INSERT INTO users (user_id) VALUES (%(user_id)s)
         ON CONFLICT (user_id) DO UPDATE SET user_id = EXCLUDED.user_id
@@ -668,14 +734,11 @@ async def api_get_stamina(request):
 async def api_consume_stamina(request):
     try:
         data = await request.json()
-        user_id = data.get("user_id")
-        token = data.get("token")
+        user_id = await resolve_user_id(request, data)
         if not user_id:
-            return web.json_response({"error": "user_id обязателен"}, status=400)
-        user_id = int(user_id)
+            return unauthorized()
+        token = data.get("token")
 
-        # Если этот же токен операции уже обрабатывался недавно — не списываем повторно,
-        # а просто возвращаем актуальное состояние (защита от повторов при обрыве связи)
         if token:
             existing = await db_query("""
                 SELECT stamina_remaining, (CASE WHEN premium_until >= CURRENT_DATE THEN 8 ELSE 4 END),
@@ -722,10 +785,9 @@ async def api_consume_stamina(request):
 async def api_buy_potion(request):
     try:
         data = await request.json()
-        user_id = data.get("user_id")
+        user_id = await resolve_user_id(request, data)
         if not user_id:
-            return web.json_response({"error": "user_id обязателен"}, status=400)
-        user_id = int(user_id)
+            return unauthorized()
 
         row = await db_query("""
             SELECT spendable_points, potion_purchases_in_week, potion_week_anchor_date,
@@ -778,11 +840,13 @@ async def api_buy_potion(request):
 # ===== ПОДЗЕМЕЛЬЯ, ПОКУПКИ, ПРЕМИУМ =====
 
 async def api_dungeon_info(request):
-    user_id = request.query.get("user_id")
     activity = request.query.get("activity")
-    if not user_id or not user_id.isdigit() or activity not in DUNGEON_COL:
+    if activity not in DUNGEON_COL:
         return web.json_response({"error": "Некорректные параметры"}, status=400)
-    user_id = int(user_id)
+    user_id = await resolve_user_id(request)
+    if not user_id:
+        return unauthorized()
+
     dungeon_col = DUNGEON_COL[activity]
     purchased_col = PURCHASED_COL[activity]
 
@@ -798,7 +862,6 @@ async def api_dungeon_info(request):
 
     requested = request.query.get("dungeon")
     dungeon_n = int(requested) if requested and requested.isdigit() else current_dungeon
-    # Разрешаем заглянуть на 1 уровень вперёд (для фоновой предзагрузки) — пройти его раньше времени всё равно нельзя
     dungeon_n = min(max(dungeon_n, 1), min(current_dungeon + 3, MAX_DUNGEON))
 
     dungeon_data = generate_dungeon(activity, dungeon_n)
@@ -826,12 +889,13 @@ async def api_dungeon_info(request):
 async def api_dungeon_complete(request):
     try:
         data = await request.json()
-        user_id = data.get("user_id")
+        user_id = await resolve_user_id(request, data)
+        if not user_id:
+            return unauthorized()
         activity = data.get("activity")
         dungeon_n = data.get("dungeon")
-        if not user_id or activity not in DUNGEON_COL or not dungeon_n:
+        if activity not in DUNGEON_COL or not dungeon_n:
             return web.json_response({"error": "Некорректные данные"}, status=400)
-        user_id = int(user_id)
         dungeon_n = int(dungeon_n)
         dungeon_col = DUNGEON_COL[activity]
 
@@ -877,12 +941,13 @@ async def api_dungeon_complete(request):
 async def api_create_zone_invoice(request):
     try:
         data = await request.json()
-        user_id = data.get("user_id")
+        user_id = await resolve_user_id(request, data)
+        if not user_id:
+            return unauthorized()
         activity = data.get("activity")
         pair_start = data.get("pair_start")
-        if not user_id or activity not in PURCHASED_COL or pair_start not in PAID_PAIR_STARTS:
+        if activity not in PURCHASED_COL or pair_start not in PAID_PAIR_STARTS:
             return web.json_response({"error": "Некорректные данные"}, status=400)
-        user_id = int(user_id)
 
         if date.today() <= FREE_STORY_UNTIL:
             return web.json_response({"error": "Сейчас всё бесплатно — платный доступ откроется после 10 сентября"}, status=400)
@@ -902,7 +967,7 @@ async def api_create_zone_invoice(request):
 
         zone = next(z for z in ZONES_META if z["n"] == pair_start)
         title = f"{zone['name']} — доступ"
-        payload = f"zone:{activity}:{pair_start}"
+        payload = f"zone:{activity}:{pair_start}:{user_id}"
 
         invoice_url = await bot.create_invoice_link(
             title=title,
@@ -919,13 +984,13 @@ async def api_create_zone_invoice(request):
 async def api_create_premium_invoice(request):
     try:
         data = await request.json()
-        user_id = data.get("user_id")
+        user_id = await resolve_user_id(request, data)
         if not user_id:
-            return web.json_response({"error": "user_id обязателен"}, status=400)
+            return unauthorized()
         invoice_url = await bot.create_invoice_link(
             title="Премиум на 30 дней",
             description="8 подходов в день вместо 4 и открытый доступ ко всем платным подземельям на 30 дней.",
-            payload="premium", provider_token="", currency="XTR",
+            payload=f"premium:{user_id}", provider_token="", currency="XTR",
             prices=[LabeledPrice(label="Премиум 30 дней", amount=PREMIUM_PRICE_STARS)],
         )
         return web.json_response({"url": invoice_url})
@@ -937,15 +1002,14 @@ async def api_create_premium_invoice(request):
 async def api_create_support_invoice(request):
     try:
         data = await request.json()
-        user_id = data.get("user_id")
-        amount = data.get("amount", 150)
+        user_id = await resolve_user_id(request, data)
         if not user_id:
-            return web.json_response({"error": "user_id обязателен"}, status=400)
-        amount = max(1, int(amount))
+            return unauthorized()
+        amount = max(1, int(data.get("amount", 150)))
         invoice_url = await bot.create_invoice_link(
             title="Поддержать PushUp Hero",
             description="Спасибо, что помогаешь проекту развиваться! Это разовый добровольный донат, ни на что игровое не влияет.",
-            payload="support", provider_token="", currency="XTR",
+            payload=f"support:{user_id}", provider_token="", currency="XTR",
             prices=[LabeledPrice(label="Поддержка проекта", amount=amount)],
         )
         return web.json_response({"url": invoice_url})
@@ -962,18 +1026,21 @@ async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
 @dp.message(F.successful_payment)
 async def process_successful_payment(message: Message):
     payload = message.successful_payment.invoice_payload
+    # user_id, от которого пришёл платёж в Telegram, — источник истины,
+    # никакой части payload из клиента для этого решения не используем.
     user_id = message.from_user.id
     try:
-        if payload == "premium":
+        if payload.startswith("premium:"):
             await db_query("""
                 UPDATE users SET premium_until = GREATEST(COALESCE(premium_until, CURRENT_DATE - 1), CURRENT_DATE) + INTERVAL '30 days'
                 WHERE user_id = %s
             """, (user_id,))
             await message.answer("✅ Премиум активирован на 30 дней! Спасибо за поддержку 🙏")
-        elif payload == "support":
+        elif payload.startswith("support:"):
             await message.answer("🤍 Спасибо за поддержку! Это очень много значит для развития проекта.")
         elif payload.startswith("zone:"):
-            _, activity, pair_start = payload.split(":")
+            parts = payload.split(":")
+            activity, pair_start = parts[1], parts[2]
             purchased_col = PURCHASED_COL.get(activity)
             if purchased_col:
                 await db_query(f"""
@@ -998,10 +1065,9 @@ async def api_health(request):
 async def api_reset_progress(request):
     try:
         data = await request.json()
-        user_id = data.get("user_id")
+        user_id = await resolve_user_id(request, data)
         if not user_id:
-            return web.json_response({"error": "user_id обязателен"}, status=400)
-        user_id = int(user_id)
+            return unauthorized()
         await db_query("""
             UPDATE users SET
                 total_points = 0, spendable_points = 0, total_pushups = 0, total_plank_seconds = 0,
