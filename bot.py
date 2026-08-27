@@ -136,13 +136,25 @@ def init_db():
     run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_stamina_token TEXT")
     run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS last_stamina_token_at TIMESTAMPTZ")
 
+    run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_quest_date DATE")
+    run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_quest_enemies INTEGER DEFAULT 0")
+    run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_quest_reps INTEGER DEFAULT 0")
+    run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_quest_hold_seconds INTEGER DEFAULT 0")
+    run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_quest_dungeons INTEGER DEFAULT 0")
+    run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_quest_claimed TEXT DEFAULT ''")
+    run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_quest_chest_claimed BOOLEAN DEFAULT FALSE")
+
+    # ===== Арена =====
+    run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS pushup_arena_wave INTEGER DEFAULT 1")
+    run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS plank_arena_wave INTEGER DEFAULT 1")
+    run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS squat_arena_wave INTEGER DEFAULT 1")
+    run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS wallsit_arena_wave INTEGER DEFAULT 1")
+
 
 init_db()
 
 
 # ===== ПРОВЕРКА ПОДПИСИ TELEGRAM (initData) =====
-# Это единственный источник правды о том, кто делает запрос — клиент больше
-# не может «представиться» чужим user_id, подпись проверяется токеном бота.
 
 def verify_init_data(init_data: str, max_age_seconds: int = 86400):
     if not init_data:
@@ -183,8 +195,6 @@ def verify_init_data(init_data: str, max_age_seconds: int = 86400):
 
 
 async def resolve_user_id(request, body=None):
-    """Достаёт и проверяет initData из тела POST-запроса или из query-параметра GET.
-    Возвращает подтверждённый Telegram user_id или None, если подпись невалидна."""
     init_data = None
     if body is not None:
         init_data = body.get("init_data")
@@ -287,6 +297,28 @@ MAX_POTIONS_PER_WEEK = 2
 
 FREE_STORY_UNTIL = date(2026, 9, 10)
 
+QUEST_TARGETS = {"enemies": 2, "reps": 30, "hold_seconds": 300, "dungeons": 1}
+QUEST_TITLES = {
+    "enemies": "⚔️ Победи 2 врагов",
+    "reps": "💪 Сделай 30 повторений (отжимания/приседания)",
+    "hold_seconds": "🔥 Продержись 5 минут (планка/стульчик)",
+    "dungeons": "🏃 Заверши один поход",
+}
+QUEST_REWARD_XP = 50
+QUEST_REWARD_ESSENCE = 20
+CHEST_REWARD_XP = 100
+CHEST_REWARD_ESSENCE = 50
+
+QUEST_RESET_FIELDS_SQL = """
+    daily_quest_enemies = CASE WHEN users.daily_quest_date IS DISTINCT FROM CURRENT_DATE THEN 0 ELSE COALESCE(users.daily_quest_enemies, 0) END,
+    daily_quest_reps = CASE WHEN users.daily_quest_date IS DISTINCT FROM CURRENT_DATE THEN 0 ELSE COALESCE(users.daily_quest_reps, 0) END,
+    daily_quest_hold_seconds = CASE WHEN users.daily_quest_date IS DISTINCT FROM CURRENT_DATE THEN 0 ELSE COALESCE(users.daily_quest_hold_seconds, 0) END,
+    daily_quest_dungeons = CASE WHEN users.daily_quest_date IS DISTINCT FROM CURRENT_DATE THEN 0 ELSE COALESCE(users.daily_quest_dungeons, 0) END,
+    daily_quest_claimed = CASE WHEN users.daily_quest_date IS DISTINCT FROM CURRENT_DATE THEN '' ELSE COALESCE(users.daily_quest_claimed, '') END,
+    daily_quest_chest_claimed = CASE WHEN users.daily_quest_date IS DISTINCT FROM CURRENT_DATE THEN FALSE ELSE COALESCE(users.daily_quest_chest_claimed, FALSE) END,
+    daily_quest_date = CURRENT_DATE
+"""
+
 
 def generate_dungeon(activity, n):
     n = min(max(n, 1), MAX_DUNGEON)
@@ -309,6 +341,7 @@ def pair_start_for_zone(n: int):
 
 DUNGEON_COL = {"pushup": "pushup_dungeon", "plank": "plank_dungeon", "squat": "squat_dungeon", "wallsit": "wallsit_dungeon"}
 PURCHASED_COL = {"pushup": "pushup_purchased_pairs", "plank": "plank_purchased_pairs", "squat": "squat_purchased_pairs", "wallsit": "wallsit_purchased_pairs"}
+ARENA_COL = {"pushup": "pushup_arena_wave", "plank": "plank_arena_wave", "squat": "squat_arena_wave", "wallsit": "wallsit_arena_wave"}
 
 ZONES_META = [
     {"n": 1, "name": "Пещера летучих мышей", "chapter": 1}, {"n": 2, "name": "Гнездо ночного хищника", "chapter": 1},
@@ -338,6 +371,45 @@ CHAPTERS = [
 
 ACTIVITY_NAMES = {"pushup": "Отжимания", "plank": "Планка", "squat": "Приседания", "wallsit": "Стульчик"}
 
+# ===== АРЕНА: генерация волн =====
+ARENA_WAVES_PER_CHAPTER = 5
+ARENA_TOTAL_CHAPTERS = 10
+ARENA_CYCLE_LEN = ARENA_WAVES_PER_CHAPTER * ARENA_TOTAL_CHAPTERS  # 50
+
+
+def generate_arena_wave(activity, wave_n):
+    wave_n = max(1, wave_n)
+    zones = ZONE_TABLES[activity]
+
+    cycle_index = (wave_n - 1) // ARENA_CYCLE_LEN
+    pos_in_cycle = (wave_n - 1) % ARENA_CYCLE_LEN
+    chapter = pos_in_cycle // ARENA_WAVES_PER_CHAPTER + 1
+    local_wave = pos_in_cycle % ARENA_WAVES_PER_CHAPTER + 1
+    scale = 1 + 0.5 * cycle_index  # каждый полный проход по 10 главам — враги крепче
+
+    n_normal = 2 * chapter - 1
+    n_boss = 2 * chapter
+    normal_count, normal_total = zones[n_normal - 1]
+    boss_count, boss_total = zones[n_boss - 1]
+
+    normal_hp_each = max(1, round((normal_total / normal_count) * scale))
+    boss_hp_each = max(1, round(boss_total * scale))
+
+    counts_by_local_wave = {1: 3, 2: 5, 3: 7, 4: 10}
+    enemies = []
+    if local_wave in counts_by_local_wave:
+        cnt = counts_by_local_wave[local_wave]
+        enemies = [{"hp": normal_hp_each, "zone": n_normal, "is_boss": False} for _ in range(cnt)]
+    else:  # local_wave == 5
+        enemies = [{"hp": normal_hp_each, "zone": n_normal, "is_boss": False} for _ in range(10)]
+        enemies += [{"hp": boss_hp_each, "zone": n_boss, "is_boss": True} for _ in range(2)]
+
+    xp_reward = sum(e["hp"] for e in enemies)
+    return {
+        "wave": wave_n, "chapter": chapter, "local_wave": local_wave, "cycle": cycle_index + 1,
+        "enemies": enemies, "xp_reward": xp_reward,
+    }
+
 
 @dp.message(CommandStart())
 async def start_handler(message: Message):
@@ -345,7 +417,7 @@ async def start_handler(message: Message):
     username = message.from_user.first_name or message.from_user.username or "Игрок"
     await ensure_user_exists(user_id, username)
 
-    personal_url = f"{WEBAPP_URL}?v=14"
+    personal_url = f"{WEBAPP_URL}?v=16"
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚀 Начать приключение", web_app=WebAppInfo(url=personal_url))]
@@ -354,8 +426,9 @@ async def start_handler(message: Message):
     await message.answer(
         "⚔️ PushUp Hero\n\n"
         "Спорт ещё никогда не был таким затягивающим. Каждое отжимание — удар по врагу, каждая тренировка — шаг в истории, где ты главный герой.\n\n"
-        "📹 Проходи сюжетную кампанию или тренируйся свободно перед камерой — бот всё засчитает сам.\n"
-        "🏆 Получай награды, качай персонажа, соревнуйся в таблице лидеров.\n\n"
+        "📹 Проходи сюжетную кампанию, испытай себя на бесконечной Арене или тренируйся свободно перед камерой — бот всё засчитает сам.\n"
+        "🏆 Получай награды, качай персонажа, соревнуйся в таблице лидеров.\n"
+        "📅 Каждый день — новые задания с наградами.\n\n"
         "🎉 Сюжет полностью открыт и бесплатен для всех до 10 сентября включительно. После этой даты платными станут главы, начиная с IV — «Лес, который помнит» (200 ⭐ за пару подземелий).\n\n"
         f"💬 Новости и пожелания — в группе: {COMMUNITY_URL}",
         reply_markup=keyboard
@@ -416,6 +489,7 @@ async def api_profile(request):
                       pushup_achv_level, squat_achv_level,
                       stamina_remaining, stamina_reset_date, premium_until, story_enabled,
                       potion_purchases_in_week, potion_week_anchor_date,
+                      pushup_arena_wave, plank_arena_wave, squat_arena_wave, wallsit_arena_wave,
                       CURRENT_DATE
         """, {"user_id": user_id}, fetchone=True)
 
@@ -427,6 +501,7 @@ async def api_profile(request):
          pushup_achv_level, squat_achv_level,
          stamina_remaining, stamina_reset_date, premium_until, story_enabled,
          potion_purchases_in_week, potion_week_anchor_date,
+         pushup_arena_wave, plank_arena_wave, squat_arena_wave, wallsit_arena_wave,
          today) = row
 
         def today_or_zero(value, last_date):
@@ -459,10 +534,10 @@ async def api_profile(request):
             "level": level_title, "points": points,
             "next_level": next_title,
             "points_to_next_level": (next_threshold - points) if next_threshold else None,
-            "pushup": {"today": pushups_today, "streak": streak_or_zero(pushup_streak, last_pushup_date), "best_streak": pushup_best_streak or 0, "total": total_pushups, "dungeon": pushup_dungeon},
-            "plank": {"today_seconds": plank_today, "streak": streak_or_zero(plank_streak, last_plank_date), "best_streak": plank_best_streak or 0, "total_seconds": total_plank_seconds, "dungeon": plank_dungeon},
-            "squat": {"today": squats_today, "streak": streak_or_zero(squat_streak, last_squat_date), "best_streak": squat_best_streak or 0, "total": total_squats, "dungeon": squat_dungeon},
-            "wallsit": {"today_seconds": wallsit_today, "streak": streak_or_zero(wallsit_streak, last_wallsit_date), "best_streak": wallsit_best_streak or 0, "total_seconds": total_wallsit_seconds, "dungeon": wallsit_dungeon},
+            "pushup": {"today": pushups_today, "streak": streak_or_zero(pushup_streak, last_pushup_date), "best_streak": pushup_best_streak or 0, "total": total_pushups, "dungeon": pushup_dungeon, "arena_wave": pushup_arena_wave or 1},
+            "plank": {"today_seconds": plank_today, "streak": streak_or_zero(plank_streak, last_plank_date), "best_streak": plank_best_streak or 0, "total_seconds": total_plank_seconds, "dungeon": plank_dungeon, "arena_wave": plank_arena_wave or 1},
+            "squat": {"today": squats_today, "streak": streak_or_zero(squat_streak, last_squat_date), "best_streak": squat_best_streak or 0, "total": total_squats, "dungeon": squat_dungeon, "arena_wave": squat_arena_wave or 1},
+            "wallsit": {"today_seconds": wallsit_today, "streak": streak_or_zero(wallsit_streak, last_wallsit_date), "best_streak": wallsit_best_streak or 0, "total_seconds": total_wallsit_seconds, "dungeon": wallsit_dungeon, "arena_wave": wallsit_arena_wave or 1},
             "achievements": {"pushup_level": pushup_achv_level or 0, "pushup_today": pushups_today, "pushup_next_threshold": pushup_next, "squat_level": squat_achv_level or 0, "squat_today": squats_today, "squat_next_threshold": squat_next},
             "stamina": {"remaining": stamina_display, "max": stamina_max},
             "premium_active": premium_active,
@@ -504,6 +579,22 @@ async def api_story_meta(request):
 async def api_leaderboard(request):
     activity = request.query.get("activity", "pushup")
     period = request.query.get("period", "total")
+    arena = request.query.get("arena") == "true"
+
+    if arena:
+        if activity not in ARENA_COL:
+            return web.json_response({"error": "Некорректная дисциплина"}, status=400)
+        col = ARENA_COL[activity]
+        try:
+            rows = await db_query(f"""
+                SELECT COALESCE(nickname, username, 'Игрок') AS name, {col} AS value
+                FROM users WHERE {col} > 1 ORDER BY value DESC LIMIT 10
+            """, fetchall=True)
+            leaderboard = [{"name": name, "value": value} for name, value in rows]
+            return web.json_response({"leaderboard": leaderboard, "activity": activity, "arena": True})
+        except Exception as e:
+            print(f"Ошибка в api_leaderboard (arena): {e}")
+            return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
 
     col_map = {
         "pushup": ("total_pushups", "daily_pushups", "last_pushup_date"),
@@ -548,9 +639,11 @@ async def api_save_pushups(request):
         points_earned = count * 10
 
         row = await db_query(f"""
-            INSERT INTO users (user_id, total_points, spendable_points, total_pushups, daily_pushups, last_pushup_date, pushup_streak, pushup_best_streak, pushup_achv_level)
+            INSERT INTO users (user_id, total_points, spendable_points, total_pushups, daily_pushups, last_pushup_date, pushup_streak, pushup_best_streak, pushup_achv_level,
+                                daily_quest_date, daily_quest_reps)
             VALUES (%(user_id)s, %(points)s, %(points)s, %(count)s, %(count)s, CURRENT_DATE, 1, 1,
-                    CASE WHEN %(count)s >= 20 THEN 1 ELSE 0 END)
+                    CASE WHEN %(count)s >= 20 THEN 1 ELSE 0 END,
+                    CURRENT_DATE, %(count)s)
             ON CONFLICT (user_id) DO UPDATE SET
                 total_points = users.total_points + %(points)s,
                 spendable_points = COALESCE(users.spendable_points, 0) + %(points)s,
@@ -568,7 +661,9 @@ async def api_save_pushups(request):
                 pushup_achv_level = CASE
                     WHEN (CASE WHEN users.last_pushup_date = CURRENT_DATE THEN users.daily_pushups + %(count)s ELSE %(count)s END)
                          >= (10 + 10 * (COALESCE(users.pushup_achv_level, 0) + 1))
-                    THEN COALESCE(users.pushup_achv_level, 0) + 1 ELSE COALESCE(users.pushup_achv_level, 0) END
+                    THEN COALESCE(users.pushup_achv_level, 0) + 1 ELSE COALESCE(users.pushup_achv_level, 0) END,
+                {QUEST_RESET_FIELDS_SQL.replace('daily_quest_reps = CASE WHEN users.daily_quest_date IS DISTINCT FROM CURRENT_DATE THEN 0 ELSE COALESCE(users.daily_quest_reps, 0) END,',
+                                                 'daily_quest_reps = CASE WHEN users.daily_quest_date IS DISTINCT FROM CURRENT_DATE THEN %(count)s ELSE COALESCE(users.daily_quest_reps, 0) + %(count)s END,')}
             RETURNING total_points - %(points)s AS points_before, total_points AS points_after
         """, {"points": points_earned, "count": count, "user_id": user_id}, fetchone=True)
 
@@ -595,9 +690,11 @@ async def api_save_squats(request):
         points_earned = count * 10
 
         row = await db_query(f"""
-            INSERT INTO users (user_id, total_points, spendable_points, total_squats, daily_squats, last_squat_date, squat_streak, squat_best_streak, squat_achv_level)
+            INSERT INTO users (user_id, total_points, spendable_points, total_squats, daily_squats, last_squat_date, squat_streak, squat_best_streak, squat_achv_level,
+                                daily_quest_date, daily_quest_reps)
             VALUES (%(user_id)s, %(points)s, %(points)s, %(count)s, %(count)s, CURRENT_DATE, 1, 1,
-                    CASE WHEN %(count)s >= 20 THEN 1 ELSE 0 END)
+                    CASE WHEN %(count)s >= 20 THEN 1 ELSE 0 END,
+                    CURRENT_DATE, %(count)s)
             ON CONFLICT (user_id) DO UPDATE SET
                 total_points = users.total_points + %(points)s,
                 spendable_points = COALESCE(users.spendable_points, 0) + %(points)s,
@@ -615,7 +712,9 @@ async def api_save_squats(request):
                 squat_achv_level = CASE
                     WHEN (CASE WHEN users.last_squat_date = CURRENT_DATE THEN users.daily_squats + %(count)s ELSE %(count)s END)
                          >= (10 + 10 * (COALESCE(users.squat_achv_level, 0) + 1))
-                    THEN COALESCE(users.squat_achv_level, 0) + 1 ELSE COALESCE(users.squat_achv_level, 0) END
+                    THEN COALESCE(users.squat_achv_level, 0) + 1 ELSE COALESCE(users.squat_achv_level, 0) END,
+                {QUEST_RESET_FIELDS_SQL.replace('daily_quest_reps = CASE WHEN users.daily_quest_date IS DISTINCT FROM CURRENT_DATE THEN 0 ELSE COALESCE(users.daily_quest_reps, 0) END,',
+                                                 'daily_quest_reps = CASE WHEN users.daily_quest_date IS DISTINCT FROM CURRENT_DATE THEN %(count)s ELSE COALESCE(users.daily_quest_reps, 0) + %(count)s END,')}
             RETURNING total_points - %(points)s AS points_before, total_points AS points_after
         """, {"points": points_earned, "count": count, "user_id": user_id}, fetchone=True)
 
@@ -641,9 +740,11 @@ async def api_save_plank(request):
         seconds = int(seconds)
         points_earned = seconds * 2
 
-        row = await db_query("""
-            INSERT INTO users (user_id, total_points, spendable_points, total_plank_seconds, daily_plank_seconds, last_plank_date, plank_streak, plank_best_streak)
-            VALUES (%(user_id)s, %(points)s, %(points)s, %(seconds)s, %(seconds)s, CURRENT_DATE, 1, 1)
+        row = await db_query(f"""
+            INSERT INTO users (user_id, total_points, spendable_points, total_plank_seconds, daily_plank_seconds, last_plank_date, plank_streak, plank_best_streak,
+                                daily_quest_date, daily_quest_hold_seconds)
+            VALUES (%(user_id)s, %(points)s, %(points)s, %(seconds)s, %(seconds)s, CURRENT_DATE, 1, 1,
+                    CURRENT_DATE, %(seconds)s)
             ON CONFLICT (user_id) DO UPDATE SET
                 total_points = users.total_points + %(points)s,
                 spendable_points = COALESCE(users.spendable_points, 0) + %(points)s,
@@ -657,7 +758,9 @@ async def api_save_plank(request):
                     CASE WHEN users.last_plank_date = CURRENT_DATE THEN COALESCE(users.plank_streak, 1)
                          WHEN users.last_plank_date = CURRENT_DATE - INTERVAL '1 day' THEN COALESCE(users.plank_streak, 0) + 1
                          ELSE 1 END),
-                last_plank_date = CURRENT_DATE
+                last_plank_date = CURRENT_DATE,
+                {QUEST_RESET_FIELDS_SQL.replace('daily_quest_hold_seconds = CASE WHEN users.daily_quest_date IS DISTINCT FROM CURRENT_DATE THEN 0 ELSE COALESCE(users.daily_quest_hold_seconds, 0) END,',
+                                                 'daily_quest_hold_seconds = CASE WHEN users.daily_quest_date IS DISTINCT FROM CURRENT_DATE THEN %(seconds)s ELSE COALESCE(users.daily_quest_hold_seconds, 0) + %(seconds)s END,')}
             RETURNING total_points - %(points)s AS points_before, total_points AS points_after
         """, {"points": points_earned, "seconds": seconds, "user_id": user_id}, fetchone=True)
 
@@ -683,9 +786,11 @@ async def api_save_wallsit(request):
         seconds = int(seconds)
         points_earned = seconds * 2
 
-        row = await db_query("""
-            INSERT INTO users (user_id, total_points, spendable_points, total_wallsit_seconds, daily_wallsit_seconds, last_wallsit_date, wallsit_streak, wallsit_best_streak)
-            VALUES (%(user_id)s, %(points)s, %(points)s, %(seconds)s, %(seconds)s, CURRENT_DATE, 1, 1)
+        row = await db_query(f"""
+            INSERT INTO users (user_id, total_points, spendable_points, total_wallsit_seconds, daily_wallsit_seconds, last_wallsit_date, wallsit_streak, wallsit_best_streak,
+                                daily_quest_date, daily_quest_hold_seconds)
+            VALUES (%(user_id)s, %(points)s, %(points)s, %(seconds)s, %(seconds)s, CURRENT_DATE, 1, 1,
+                    CURRENT_DATE, %(seconds)s)
             ON CONFLICT (user_id) DO UPDATE SET
                 total_points = users.total_points + %(points)s,
                 spendable_points = COALESCE(users.spendable_points, 0) + %(points)s,
@@ -699,7 +804,9 @@ async def api_save_wallsit(request):
                     CASE WHEN users.last_wallsit_date = CURRENT_DATE THEN COALESCE(users.wallsit_streak, 1)
                          WHEN users.last_wallsit_date = CURRENT_DATE - INTERVAL '1 day' THEN COALESCE(users.wallsit_streak, 0) + 1
                          ELSE 1 END),
-                last_wallsit_date = CURRENT_DATE
+                last_wallsit_date = CURRENT_DATE,
+                {QUEST_RESET_FIELDS_SQL.replace('daily_quest_hold_seconds = CASE WHEN users.daily_quest_date IS DISTINCT FROM CURRENT_DATE THEN 0 ELSE COALESCE(users.daily_quest_hold_seconds, 0) END,',
+                                                 'daily_quest_hold_seconds = CASE WHEN users.daily_quest_date IS DISTINCT FROM CURRENT_DATE THEN %(seconds)s ELSE COALESCE(users.daily_quest_hold_seconds, 0) + %(seconds)s END,')}
             RETURNING total_points - %(points)s AS points_before, total_points AS points_after
         """, {"points": points_earned, "seconds": seconds, "user_id": user_id}, fetchone=True)
 
@@ -837,6 +944,118 @@ async def api_buy_potion(request):
         return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
 
 
+# ===== ЕЖЕДНЕВНЫЕ ЗАДАНИЯ =====
+
+async def api_daily_quests(request):
+    user_id = await resolve_user_id(request)
+    if not user_id:
+        return unauthorized()
+
+    row = await db_query("""
+        INSERT INTO users (user_id) VALUES (%(user_id)s)
+        ON CONFLICT (user_id) DO UPDATE SET user_id = EXCLUDED.user_id
+        RETURNING daily_quest_date, daily_quest_enemies, daily_quest_reps, daily_quest_hold_seconds,
+                  daily_quest_dungeons, daily_quest_claimed, daily_quest_chest_claimed, CURRENT_DATE
+    """, {"user_id": user_id}, fetchone=True)
+
+    (quest_date, enemies, reps, hold_seconds, dungeons, claimed_raw, chest_claimed, today) = row
+
+    is_today = (quest_date == today)
+    progress = {
+        "enemies": enemies if is_today else 0,
+        "reps": reps if is_today else 0,
+        "hold_seconds": hold_seconds if is_today else 0,
+        "dungeons": dungeons if is_today else 0,
+    }
+    claimed_list = (claimed_raw or "").split(",") if is_today else []
+    chest_claimed = chest_claimed if is_today else False
+
+    quests = []
+    for qid in ["enemies", "reps", "hold_seconds", "dungeons"]:
+        target = QUEST_TARGETS[qid]
+        current = progress[qid]
+        quests.append({
+            "id": qid, "title": QUEST_TITLES[qid],
+            "progress": min(current, target), "target": target,
+            "completed": current >= target,
+            "claimed": qid in claimed_list,
+            "reward_xp": QUEST_REWARD_XP, "reward_essence": QUEST_REWARD_ESSENCE,
+        })
+
+    all_claimed = all(q["claimed"] for q in quests)
+    return web.json_response({
+        "quests": quests,
+        "chest": {
+            "available": all_claimed and not chest_claimed,
+            "claimed": chest_claimed,
+            "reward_xp": CHEST_REWARD_XP, "reward_essence": CHEST_REWARD_ESSENCE,
+        }
+    })
+
+
+async def api_claim_quest(request):
+    try:
+        data = await request.json()
+        user_id = await resolve_user_id(request, data)
+        if not user_id:
+            return unauthorized()
+        quest_id = data.get("quest_id")
+        if quest_id not in list(QUEST_TARGETS.keys()) + ["chest"]:
+            return web.json_response({"error": "Некорректное задание"}, status=400)
+
+        row = await db_query("""
+            SELECT daily_quest_date, daily_quest_enemies, daily_quest_reps, daily_quest_hold_seconds,
+                   daily_quest_dungeons, daily_quest_claimed, daily_quest_chest_claimed, CURRENT_DATE
+            FROM users WHERE user_id = %s
+        """, (user_id,), fetchone=True)
+        if row is None:
+            return web.json_response({"error": "Пользователь не найден"}, status=404)
+
+        (quest_date, enemies, reps, hold_seconds, dungeons, claimed_raw, chest_claimed, today) = row
+        is_today = (quest_date == today)
+        if not is_today:
+            return web.json_response({"success": False, "error": "Сегодняшних заданий ещё нет прогресса"}, status=400)
+
+        claimed_list = [x for x in (claimed_raw or "").split(",") if x]
+
+        if quest_id == "chest":
+            if len(claimed_list) < 4:
+                return web.json_response({"success": False, "error": "Сначала забери награды за все 4 задания"}, status=400)
+            if chest_claimed:
+                return web.json_response({"success": False, "error": "Сундук уже открыт"}, status=400)
+            await db_query("""
+                UPDATE users SET
+                    total_points = total_points + %(xp)s,
+                    spendable_points = COALESCE(spendable_points, 0) + %(essence)s,
+                    daily_quest_chest_claimed = TRUE
+                WHERE user_id = %(user_id)s
+            """, {"xp": CHEST_REWARD_XP, "essence": CHEST_REWARD_ESSENCE, "user_id": user_id})
+            return web.json_response({"success": True, "reward_xp": CHEST_REWARD_XP, "reward_essence": CHEST_REWARD_ESSENCE})
+
+        if quest_id in claimed_list:
+            return web.json_response({"success": False, "error": "Уже получено"}, status=400)
+
+        progress_map = {"enemies": enemies, "reps": reps, "hold_seconds": hold_seconds, "dungeons": dungeons}
+        if progress_map[quest_id] < QUEST_TARGETS[quest_id]:
+            return web.json_response({"success": False, "error": "Задание ещё не выполнено"}, status=400)
+
+        claimed_list.append(quest_id)
+        new_claimed = ",".join(claimed_list)
+
+        await db_query("""
+            UPDATE users SET
+                total_points = total_points + %(xp)s,
+                spendable_points = COALESCE(spendable_points, 0) + %(essence)s,
+                daily_quest_claimed = %(claimed)s
+            WHERE user_id = %(user_id)s
+        """, {"xp": QUEST_REWARD_XP, "essence": QUEST_REWARD_ESSENCE, "claimed": new_claimed, "user_id": user_id})
+
+        return web.json_response({"success": True, "reward_xp": QUEST_REWARD_XP, "reward_essence": QUEST_REWARD_ESSENCE})
+    except Exception as e:
+        print(f"Ошибка в api_claim_quest: {e}")
+        return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
+
+
 # ===== ПОДЗЕМЕЛЬЯ, ПОКУПКИ, ПРЕМИУМ =====
 
 async def api_dungeon_info(request):
@@ -909,6 +1128,7 @@ async def api_dungeon_complete(request):
         dungeon_data = generate_dungeon(activity, dungeon_n)
         is_replay = dungeon_n < current_dungeon
         xp_reward = dungeon_data["xp_reward"] if not is_replay else dungeon_data["xp_reward"] // 2
+        enemy_count = len(dungeon_data["enemies"])
 
         new_dungeon = current_dungeon
         if not is_replay and current_dungeon < MAX_DUNGEON:
@@ -918,10 +1138,17 @@ async def api_dungeon_complete(request):
             UPDATE users
             SET total_points = total_points + %(xp)s,
                 spendable_points = COALESCE(spendable_points, 0) + %(xp)s,
-                {dungeon_col} = %(new_dungeon)s
+                {dungeon_col} = %(new_dungeon)s,
+                {QUEST_RESET_FIELDS_SQL.replace(
+                    "daily_quest_enemies = CASE WHEN users.daily_quest_date IS DISTINCT FROM CURRENT_DATE THEN 0 ELSE COALESCE(users.daily_quest_enemies, 0) END,",
+                    "daily_quest_enemies = CASE WHEN users.daily_quest_date IS DISTINCT FROM CURRENT_DATE THEN %(enemies)s ELSE COALESCE(users.daily_quest_enemies, 0) + %(enemies)s END,"
+                ).replace(
+                    "daily_quest_dungeons = CASE WHEN users.daily_quest_date IS DISTINCT FROM CURRENT_DATE THEN 0 ELSE COALESCE(users.daily_quest_dungeons, 0) END,",
+                    "daily_quest_dungeons = CASE WHEN users.daily_quest_date IS DISTINCT FROM CURRENT_DATE THEN 1 ELSE COALESCE(users.daily_quest_dungeons, 0) + 1 END,"
+                )}
             WHERE user_id = %(user_id)s
             RETURNING total_points - %(xp)s AS points_before, total_points AS points_after
-        """, {"xp": xp_reward, "new_dungeon": new_dungeon, "user_id": user_id}, fetchone=True)
+        """, {"xp": xp_reward, "new_dungeon": new_dungeon, "user_id": user_id, "enemies": enemy_count}, fetchone=True)
 
         points_before, points_after = points_row
         level_before = get_level(points_before)
@@ -935,6 +1162,86 @@ async def api_dungeon_complete(request):
         })
     except Exception as e:
         print(f"Ошибка в api_dungeon_complete: {e}")
+        return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
+
+
+# ===== АРЕНА =====
+
+async def api_arena_info(request):
+    activity = request.query.get("activity")
+    if activity not in ARENA_COL:
+        return web.json_response({"error": "Некорректные параметры"}, status=400)
+    user_id = await resolve_user_id(request)
+    if not user_id:
+        return unauthorized()
+
+    col = ARENA_COL[activity]
+    row = await db_query(f"""
+        INSERT INTO users (user_id) VALUES (%(user_id)s)
+        ON CONFLICT (user_id) DO UPDATE SET user_id = EXCLUDED.user_id
+        RETURNING {col}
+    """, {"user_id": user_id}, fetchone=True)
+    (current_wave,) = row
+    current_wave = current_wave or 1
+
+    wave_data = generate_arena_wave(activity, current_wave)
+    return web.json_response(wave_data)
+
+
+async def api_arena_wave_complete(request):
+    try:
+        data = await request.json()
+        user_id = await resolve_user_id(request, data)
+        if not user_id:
+            return unauthorized()
+        activity = data.get("activity")
+        wave_n = data.get("wave")
+        if activity not in ARENA_COL or not wave_n:
+            return web.json_response({"error": "Некорректные данные"}, status=400)
+        wave_n = int(wave_n)
+        col = ARENA_COL[activity]
+
+        wave_data = generate_arena_wave(activity, wave_n)
+        xp_reward = wave_data["xp_reward"]
+        enemy_count = len(wave_data["enemies"])
+
+        row = await db_query(f"""
+            INSERT INTO users (user_id) VALUES (%(user_id)s)
+            ON CONFLICT (user_id) DO UPDATE SET user_id = EXCLUDED.user_id
+            RETURNING {col}
+        """, {"user_id": user_id}, fetchone=True)
+        (current_wave,) = row
+        current_wave = current_wave or 1
+
+        # Продвигаем волну, только если игрок реально был на ней (защита от гонки/повторов)
+        new_wave = current_wave
+        if wave_n == current_wave:
+            new_wave = current_wave + 1
+
+        points_row = await db_query(f"""
+            UPDATE users
+            SET total_points = total_points + %(xp)s,
+                spendable_points = COALESCE(spendable_points, 0) + %(xp)s,
+                {col} = %(new_wave)s,
+                {QUEST_RESET_FIELDS_SQL.replace(
+                    "daily_quest_enemies = CASE WHEN users.daily_quest_date IS DISTINCT FROM CURRENT_DATE THEN 0 ELSE COALESCE(users.daily_quest_enemies, 0) END,",
+                    "daily_quest_enemies = CASE WHEN users.daily_quest_date IS DISTINCT FROM CURRENT_DATE THEN %(enemies)s ELSE COALESCE(users.daily_quest_enemies, 0) + %(enemies)s END,"
+                )}
+            WHERE user_id = %(user_id)s
+            RETURNING total_points - %(xp)s AS points_before, total_points AS points_after
+        """, {"xp": xp_reward, "new_wave": new_wave, "user_id": user_id, "enemies": enemy_count}, fetchone=True)
+
+        points_before, points_after = points_row
+        level_before = get_level(points_before)
+        level_after = get_level(points_after)
+
+        return web.json_response({
+            "success": True, "xp_earned": xp_reward, "new_wave": new_wave,
+            "level_up": level_after != level_before,
+            "new_level": level_after if level_after != level_before else None
+        })
+    except Exception as e:
+        print(f"Ошибка в api_arena_wave_complete: {e}")
         return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
 
 
@@ -1026,8 +1333,6 @@ async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
 @dp.message(F.successful_payment)
 async def process_successful_payment(message: Message):
     payload = message.successful_payment.invoice_payload
-    # user_id, от которого пришёл платёж в Telegram, — источник истины,
-    # никакой части payload из клиента для этого решения не используем.
     user_id = message.from_user.id
     try:
         if payload.startswith("premium:"):
@@ -1079,7 +1384,10 @@ async def api_reset_progress(request):
                 pushup_dungeon = 1, plank_dungeon = 1, squat_dungeon = 1, wallsit_dungeon = 1,
                 pushup_achv_level = 0, squat_achv_level = 0,
                 pushup_purchased_pairs = '', plank_purchased_pairs = '', squat_purchased_pairs = '', wallsit_purchased_pairs = '',
-                pushup_story_seen = '', potion_purchases_in_week = 0, potion_week_anchor_date = NULL
+                pushup_story_seen = '', potion_purchases_in_week = 0, potion_week_anchor_date = NULL,
+                daily_quest_date = NULL, daily_quest_enemies = 0, daily_quest_reps = 0, daily_quest_hold_seconds = 0,
+                daily_quest_dungeons = 0, daily_quest_claimed = '', daily_quest_chest_claimed = FALSE,
+                pushup_arena_wave = 1, plank_arena_wave = 1, squat_arena_wave = 1, wallsit_arena_wave = 1
             WHERE user_id = %s
         """, (user_id,))
         return web.json_response({"success": True})
@@ -1119,10 +1427,14 @@ def main():
     app.router.add_post("/api/save_wallsit", api_save_wallsit)
     app.router.add_get("/api/dungeon_info", api_dungeon_info)
     app.router.add_post("/api/dungeon_complete", api_dungeon_complete)
+    app.router.add_get("/api/arena_info", api_arena_info)
+    app.router.add_post("/api/arena_wave_complete", api_arena_wave_complete)
     app.router.add_post("/api/reset_progress", api_reset_progress)
     app.router.add_get("/api/stamina", api_get_stamina)
     app.router.add_post("/api/consume_stamina", api_consume_stamina)
     app.router.add_post("/api/buy_potion", api_buy_potion)
+    app.router.add_get("/api/daily_quests", api_daily_quests)
+    app.router.add_post("/api/claim_quest", api_claim_quest)
     app.router.add_post("/api/create_zone_invoice", api_create_zone_invoice)
     app.router.add_post("/api/create_premium_invoice", api_create_premium_invoice)
     app.router.add_post("/api/create_support_invoice", api_create_support_invoice)
