@@ -1,0 +1,13 @@
+name: Keep Alive Render
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping PushUp Hero server
+        run: curl -sf https://pushup-bot-server.onrender.com/ || echo "Ping failed, but that's okay"
