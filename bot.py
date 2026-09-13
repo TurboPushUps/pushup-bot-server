@@ -144,7 +144,6 @@ def init_db():
     run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_quest_claimed TEXT DEFAULT ''")
     run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS daily_quest_chest_claimed BOOLEAN DEFAULT FALSE")
 
-    # ===== Арена =====
     run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS pushup_arena_wave INTEGER DEFAULT 1")
     run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS plank_arena_wave INTEGER DEFAULT 1")
     run_query("ALTER TABLE users ADD COLUMN IF NOT EXISTS squat_arena_wave INTEGER DEFAULT 1")
@@ -153,8 +152,6 @@ def init_db():
 
 init_db()
 
-
-# ===== ПРОВЕРКА ПОДПИСИ TELEGRAM (initData) =====
 
 def verify_init_data(init_data: str, max_age_seconds: int = 86400):
     if not init_data:
@@ -268,8 +265,6 @@ def get_next_level_info(points):
     return None, None
 
 
-# ===== ПОДЗЕМЕЛЬЯ: 20 уровней (10 глав x 2), 4 дисциплины =====
-
 PUSHUP_ZONES = [
     (3, 15), (1, 25), (4, 30), (1, 40), (5, 45), (1, 55), (6, 60), (1, 70),
     (7, 85), (1, 100), (8, 110), (1, 125), (9, 140), (1, 160), (10, 175), (1, 200),
@@ -371,10 +366,9 @@ CHAPTERS = [
 
 ACTIVITY_NAMES = {"pushup": "Отжимания", "plank": "Планка", "squat": "Приседания", "wallsit": "Стульчик"}
 
-# ===== АРЕНА: генерация волн =====
 ARENA_WAVES_PER_CHAPTER = 5
 ARENA_TOTAL_CHAPTERS = 10
-ARENA_CYCLE_LEN = ARENA_WAVES_PER_CHAPTER * ARENA_TOTAL_CHAPTERS  # 50
+ARENA_CYCLE_LEN = ARENA_WAVES_PER_CHAPTER * ARENA_TOTAL_CHAPTERS
 
 
 def generate_arena_wave(activity, wave_n):
@@ -385,7 +379,7 @@ def generate_arena_wave(activity, wave_n):
     pos_in_cycle = (wave_n - 1) % ARENA_CYCLE_LEN
     chapter = pos_in_cycle // ARENA_WAVES_PER_CHAPTER + 1
     local_wave = pos_in_cycle % ARENA_WAVES_PER_CHAPTER + 1
-    scale = 1 + 0.5 * cycle_index  # каждый полный проход по 10 главам — враги крепче
+    scale = 1 + 0.5 * cycle_index
 
     n_normal = 2 * chapter - 1
     n_boss = 2 * chapter
@@ -402,7 +396,7 @@ def generate_arena_wave(activity, wave_n):
         enemies = [{"hp": normal_hp_each, "zone": n_normal, "is_boss": False} for _ in range(cnt)]
     else:  # local_wave == 5
         enemies = [{"hp": normal_hp_each, "zone": n_normal, "is_boss": False} for _ in range(10)]
-        enemies += [{"hp": boss_hp_each, "zone": n_boss, "is_boss": True} for _ in range(2)]
+        enemies += [{"hp": boss_hp_each, "zone": n_boss, "is_boss": True} for _ in range(1)]
 
     xp_reward = sum(e["hp"] for e in enemies)
     return {
@@ -417,7 +411,7 @@ async def start_handler(message: Message):
     username = message.from_user.first_name or message.from_user.username or "Игрок"
     await ensure_user_exists(user_id, username)
 
-    personal_url = f"{WEBAPP_URL}?v=16"
+    personal_url = f"{WEBAPP_URL}?v=18"
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚀 Начать приключение", web_app=WebAppInfo(url=personal_url))]
@@ -434,8 +428,6 @@ async def start_handler(message: Message):
         reply_markup=keyboard
     )
 
-
-# ===== API: базовые =====
 
 async def api_user_status(request):
     user_id = await resolve_user_id(request)
@@ -740,7 +732,7 @@ async def api_save_plank(request):
         seconds = int(seconds)
         points_earned = seconds * 2
 
-        row = await db_query(f"""
+        row = await db_query("""
             INSERT INTO users (user_id, total_points, spendable_points, total_plank_seconds, daily_plank_seconds, last_plank_date, plank_streak, plank_best_streak,
                                 daily_quest_date, daily_quest_hold_seconds)
             VALUES (%(user_id)s, %(points)s, %(points)s, %(seconds)s, %(seconds)s, CURRENT_DATE, 1, 1,
@@ -786,7 +778,7 @@ async def api_save_wallsit(request):
         seconds = int(seconds)
         points_earned = seconds * 2
 
-        row = await db_query(f"""
+        row = await db_query("""
             INSERT INTO users (user_id, total_points, spendable_points, total_wallsit_seconds, daily_wallsit_seconds, last_wallsit_date, wallsit_streak, wallsit_best_streak,
                                 daily_quest_date, daily_quest_hold_seconds)
             VALUES (%(user_id)s, %(points)s, %(points)s, %(seconds)s, %(seconds)s, CURRENT_DATE, 1, 1,
@@ -819,8 +811,6 @@ async def api_save_wallsit(request):
         print(f"Ошибка в api_save_wallsit: {e}")
         return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
 
-
-# ===== СТАМИНА =====
 
 async def api_get_stamina(request):
     user_id = await resolve_user_id(request)
@@ -887,8 +877,6 @@ async def api_consume_stamina(request):
         return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
 
 
-# ===== ЗЕЛЬЯ ВЫНОСЛИВОСТИ =====
-
 async def api_buy_potion(request):
     try:
         data = await request.json()
@@ -943,8 +931,6 @@ async def api_buy_potion(request):
         print(f"Ошибка в api_buy_potion: {e}")
         return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
 
-
-# ===== ЕЖЕДНЕВНЫЕ ЗАДАНИЯ =====
 
 async def api_daily_quests(request):
     user_id = await resolve_user_id(request)
@@ -1056,8 +1042,6 @@ async def api_claim_quest(request):
         return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
 
 
-# ===== ПОДЗЕМЕЛЬЯ, ПОКУПКИ, ПРЕМИУМ =====
-
 async def api_dungeon_info(request):
     activity = request.query.get("activity")
     if activity not in DUNGEON_COL:
@@ -1165,8 +1149,6 @@ async def api_dungeon_complete(request):
         return web.json_response({"error": "Внутренняя ошибка сервера"}, status=500)
 
 
-# ===== АРЕНА =====
-
 async def api_arena_info(request):
     activity = request.query.get("activity")
     if activity not in ARENA_COL:
@@ -1213,7 +1195,6 @@ async def api_arena_wave_complete(request):
         (current_wave,) = row
         current_wave = current_wave or 1
 
-        # Продвигаем волну, только если игрок реально был на ней (защита от гонки/повторов)
         new_wave = current_wave
         if wave_n == current_wave:
             new_wave = current_wave + 1
